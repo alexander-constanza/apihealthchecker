@@ -6,8 +6,7 @@ A monitoring service that continuously checks HTTP endpoints and AWS resources,
 records every result over time, classifies failures by category and severity,
 and serves a live status page.
 
-**Live demo:** TODO, add the deployed URL here after running the steps in
-[DEPLOY.md](DEPLOY.md).
+**Live demo:** https://apihealthchecker.fly.dev/ ([deployment steps](DEPLOY.md))
 
 ![Status page screenshot](docs/screenshot.png)
 
