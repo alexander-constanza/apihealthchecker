@@ -1,0 +1,20 @@
+# 100 columns rather than the default 88, matching the three source repos this
+# service is composed from. The classifier's keyword tables in particular read
+# better on one line than wrapped.
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[lint.per-file-ignores]
+# The vendored engine is upstream code from infra-health-check, kept byte for
+# byte apart from its import paths so it can be re-vendored by copying the file
+# again. Linting it to this repo's taste would create a diff against upstream
+# that has to be reapplied on every update, which is exactly the maintenance
+# burden vendoring is supposed to avoid.
+#
+# UP is excluded specifically as well as B: upstream targets Python 3.10, where
+# enum.StrEnum does not exist, so UP042's suggested rewrite of `class
+# Status(str, Enum)` would break the source repo it came from.
+"apihealthchecker/engine/*.py" = ["E501", "B", "UP"]

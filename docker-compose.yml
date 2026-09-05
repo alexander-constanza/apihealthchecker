@@ -1,0 +1,28 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # Matches the volume mount below. The same variable is what fly.toml sets
+      # to the Fly volume path, so local and deployed differ by configuration
+      # rather than by code.
+      DB_PATH: /data/apihealthchecker.db
+      PORT: "8080"
+      # Seed the demo monitors on first boot. Idempotent, so leaving it on does
+      # not duplicate anything, but it is off by default in the image.
+      SEED_ON_START: "1"
+    volumes:
+      - app_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  # Without this the SQLite file lives in the container layer and every
+  # rebuild silently discards the check history.
+  app_data:

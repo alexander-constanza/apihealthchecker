@@ -1,0 +1,55 @@
+# Fly.io configuration.
+#
+# `fly launch --no-deploy` will offer to overwrite this file. Keep this one:
+# the volume mount and the DB_PATH below have to agree, and a generated
+# fly.toml does not know about either.
+
+app = "apihealthchecker"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  # Must sit inside the [mounts] destination below. If these two disagree the
+  # app writes its SQLite file into the container filesystem, everything looks
+  # fine, and the entire check history disappears on the next deploy.
+  DB_PATH = "/data/apihealthchecker.db"
+  SEED_ON_START = "1"
+
+[[mounts]]
+  source = "apihealthchecker_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+
+  # A monitoring service that stops running when nobody is looking at it stops
+  # monitoring. auto_stop would suspend the machine between requests and the
+  # scheduler with it, leaving gaps in the history that look like downtime.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  # One machine. The scheduler lease (see scheduler.py) makes more than one
+  # safe from a correctness standpoint, but a second machine would get its own
+  # volume and therefore its own separate database, which is a different
+  # problem and needs Postgres rather than SQLite to solve properly.
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 40
+    hard_limit = 80
+
+[[http_service.checks]]
+  grace_period = "15s"
+  interval = "30s"
+  method = "GET"
+  timeout = "5s"
+  path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  cpus = 1

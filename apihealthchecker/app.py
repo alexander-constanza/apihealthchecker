@@ -1,0 +1,429 @@
+"""The Flask service: REST API, status page, and scheduler startup.
+
+The request-lifecycle patterns here (request-id propagation, JSON access logs,
+the HTTPException-vs-Exception handler split, the app factory) are ported from
+github.com/alexander-constanza/api-debugging-toolkit. See the comments on each.
+"""
+import logging
+import os
+import time
+import uuid
+
+from flask import Flask, g, jsonify, render_template, request
+from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
+from werkzeug.exceptions import HTTPException
+
+from apihealthchecker.classifier import worst_severity
+from apihealthchecker.db import (
+    CheckResultRow,
+    Monitor,
+    SessionLocal,
+    check_db_connection,
+    init_db,
+)
+from apihealthchecker.logging_config import configure_logging
+from apihealthchecker.runner import run_single
+from apihealthchecker.scheduler import start_scheduler
+from apihealthchecker.seed import seed_monitors
+from apihealthchecker.validation import parse_limit, validate_monitor
+
+logger = logging.getLogger("apihealthchecker")
+
+# How many recent results the UI draws in each monitor's history strip.
+SPARKLINE_POINTS = 30
+
+
+def create_app(start_background_scheduler: bool | None = None) -> Flask:
+    """Application factory.
+
+    Ported from the toolkit's create_app: importing this module has no side
+    effects, so tests build an app without a scheduler thread and gunicorn gets
+    a fresh one per worker.
+
+    `start_background_scheduler` defaults to reading the environment. Tests pass
+    False explicitly, which is why it is a parameter and not just an env lookup:
+    a test suite that has to set an environment variable to avoid starting
+    threads will eventually forget to.
+    """
+    configure_logging()
+    app = Flask(__name__)
+    app.config["JSON_SORT_KEYS"] = False
+
+    init_db()
+
+    if os.environ.get("SEED_ON_START", "0") in ("1", "true", "True"):
+        seed_monitors()
+
+    _register_lifecycle(app)
+    _register_api(app)
+    _register_errors(app)
+    _register_cli(app)
+
+    if start_background_scheduler is None:
+        start_background_scheduler = os.environ.get("RUN_SCHEDULER", "1") not in (
+            "0",
+            "false",
+            "False",
+        )
+    if start_background_scheduler:
+        # Returns None in the workers that lose the lease. See scheduler.py for
+        # why that is the expected outcome rather than a failure.
+        app.extensions["scheduler"] = start_scheduler()
+
+    return app
+
+
+def _register_lifecycle(app: Flask) -> None:
+    """Request-id propagation and JSON access logging.
+
+    Ported from api-debugging-toolkit. The one addition: an inbound
+    X-Request-Id is honoured rather than always minted fresh, so a request id
+    survives a proxy hop and still ties a client report to these log lines.
+    """
+
+    @app.before_request
+    def start_request():
+        incoming = request.headers.get("X-Request-Id", "")
+        g.request_id = incoming if 0 < len(incoming) <= 200 else str(uuid.uuid4())
+        g.start_time = time.time()
+        logger.info(
+            "request_started",
+            extra={
+                "request_id": g.request_id,
+                "method": request.method,
+                "path": request.path,
+            },
+        )
+
+    @app.after_request
+    def log_response(response):
+        duration_ms = round((time.time() - g.get("start_time", time.time())) * 1000, 2)
+        logger.info(
+            "request_completed",
+            extra={
+                "request_id": g.get("request_id", "unknown"),
+                "path": request.path,
+                "status": response.status_code,
+                "duration_ms": duration_ms,
+            },
+        )
+        response.headers["X-Request-Id"] = g.get("request_id", "unknown")
+        return response
+
+    @app.teardown_appcontext
+    def remove_session(exception=None):
+        del exception
+        # scoped_session keeps a session per thread. Without this a long-lived
+        # gunicorn thread would hold a stale one across requests and start
+        # serving data from a transaction that began minutes ago.
+        SessionLocal.remove()
+
+
+def _json_body() -> tuple[dict | None, tuple[dict, int] | None]:
+    """Parse a request body as a JSON object, or return an error tuple.
+
+    silent=True so unparseable JSON is a 400 with an explanation rather than a
+    werkzeug BadRequest that would surface as a bare error page.
+    """
+    data = request.get_json(silent=True)
+    if data is None:
+        return None, ({"error": "invalid_json", "message": "Request body must be valid JSON"}, 400)
+    if not isinstance(data, dict):
+        return None, (
+            {"error": "invalid_json", "message": "Request body must be a JSON object"},
+            400,
+        )
+    return data, None
+
+
+def _latest_results(session, monitor_ids: list[int], per_monitor: int = SPARKLINE_POINTS) -> dict:
+    """Newest `per_monitor` results for each monitor, newest first.
+
+    One query for every monitor rather than one query per monitor: the status
+    page renders every monitor at once, and a per-monitor query there is the
+    classic N+1 that makes a dashboard slow exactly when it has most to show.
+    """
+    if not monitor_ids:
+        return {}
+
+    ranked = (
+        select(
+            CheckResultRow,
+            func.row_number()
+            .over(
+                partition_by=CheckResultRow.monitor_id,
+                order_by=CheckResultRow.checked_at.desc(),
+            )
+            .label("rank"),
+        )
+        .where(CheckResultRow.monitor_id.in_(monitor_ids))
+        .subquery()
+    )
+
+    rows = session.execute(
+        select(CheckResultRow)
+        .join(ranked, ranked.c.id == CheckResultRow.id)
+        .where(ranked.c.rank <= per_monitor)
+        .order_by(CheckResultRow.monitor_id, CheckResultRow.checked_at.desc())
+    ).scalars().all()
+
+    grouped: dict[int, list] = {mid: [] for mid in monitor_ids}
+    for row in rows:
+        grouped.setdefault(row.monitor_id, []).append(row)
+    return grouped
+
+
+def _monitor_view(monitor: Monitor, results: list) -> dict:
+    """A monitor plus its latest state and recent history, as the UI wants it."""
+    latest = results[0] if results else None
+    view = monitor.to_dict()
+    view["status"] = latest.status if latest else "pending"
+    view["message"] = latest.message if latest else "No check recorded yet"
+    view["category"] = latest.category if latest else None
+    view["severity"] = latest.severity if latest else None
+    view["latency_ms"] = latest.latency_ms if latest else None
+    # Via to_dict so the UTC timezone is reattached; see db._iso.
+    view["last_checked_at"] = latest.to_dict()["checked_at"] if latest else None
+    # Oldest first so the sparkline reads left to right like a timeline.
+    view["history"] = [
+        {"status": r.status, "latency_ms": r.latency_ms, "checked_at": r.to_dict()["checked_at"]}
+        for r in reversed(results)
+    ]
+    return view
+
+
+def _register_api(app: Flask) -> None:
+    @app.route("/", methods=["GET"])
+    def index():
+        return render_template("index.html")
+
+    @app.route("/health", methods=["GET"])
+    def health():
+        """Liveness plus dependency reachability.
+
+        Ported from the toolkit: a process that is up but cannot reach its
+        database is still an outage from the caller's point of view, so this
+        returns 503 rather than a cheerful 200.
+        """
+        db_ok = check_db_connection()
+        scheduler = app.extensions.get("scheduler")
+        return jsonify(
+            {
+                "status": "ok" if db_ok else "degraded",
+                "dependencies": {"database": "ok" if db_ok else "unreachable"},
+                "scheduler": {
+                    "running_in_this_process": bool(scheduler and scheduler.owns_lease),
+                    "owner": scheduler.owner if scheduler else None,
+                },
+            }
+        ), (200 if db_ok else 503)
+
+    @app.route("/api/monitors", methods=["GET"])
+    def list_monitors():
+        session = SessionLocal()
+        monitors = session.execute(select(Monitor).order_by(Monitor.id)).scalars().all()
+        grouped = _latest_results(session, [m.id for m in monitors])
+        return jsonify(
+            {"monitors": [_monitor_view(m, grouped.get(m.id, [])) for m in monitors]}
+        )
+
+    @app.route("/api/monitors", methods=["POST"])
+    def create_monitor():
+        data, error = _json_body()
+        if error is not None:
+            body, status = error
+            return jsonify(body), status
+
+        cleaned, error = validate_monitor(data)
+        if error is not None:
+            body, status = error
+            return jsonify(body), status
+
+        session = SessionLocal()
+        try:
+            monitor = Monitor(**cleaned)
+            session.add(monitor)
+            session.commit()
+            session.refresh(monitor)
+            logger.info(
+                "monitor_created",
+                extra={"monitor_id": monitor.id, "request_id": g.get("request_id", "unknown")},
+            )
+            return jsonify(monitor.to_dict()), 201
+        except SQLAlchemyError:
+            session.rollback()
+            logger.exception(
+                "monitor_create_failed", extra={"request_id": g.get("request_id", "unknown")}
+            )
+            return jsonify({"error": "database_error"}), 500
+
+    @app.route("/api/monitors/<int:monitor_id>", methods=["DELETE"])
+    def delete_monitor(monitor_id: int):
+        session = SessionLocal()
+        monitor = session.get(Monitor, monitor_id)
+        if monitor is None:
+            return jsonify(
+                {"error": "not_found", "message": f"No monitor with id {monitor_id}"}
+            ), 404
+        try:
+            session.delete(monitor)
+            session.commit()
+            logger.info("monitor_deleted", extra={"monitor_id": monitor_id})
+            return jsonify({"deleted": monitor_id}), 200
+        except SQLAlchemyError:
+            session.rollback()
+            logger.exception("monitor_delete_failed", extra={"monitor_id": monitor_id})
+            return jsonify({"error": "database_error"}), 500
+
+    @app.route("/api/monitors/<int:monitor_id>/check", methods=["POST"])
+    def check_monitor(monitor_id: int):
+        session = SessionLocal()
+        monitor = session.get(Monitor, monitor_id)
+        if monitor is None:
+            return jsonify(
+                {"error": "not_found", "message": f"No monitor with id {monitor_id}"}
+            ), 404
+        try:
+            row = run_single(monitor, session=session)
+        except SQLAlchemyError:
+            logger.exception("check_persist_failed", extra={"monitor_id": monitor_id})
+            return jsonify({"error": "database_error"}), 500
+        if row is None:
+            return jsonify({"error": "check_failed", "message": "Check produced no result"}), 500
+        return jsonify(row.to_dict()), 201
+
+    @app.route("/api/monitors/<int:monitor_id>/history", methods=["GET"])
+    def monitor_history(monitor_id: int):
+        limit, message = parse_limit(request.args.get("limit"))
+        if limit is None:
+            return jsonify(
+                {"error": "invalid_parameter", "parameter": "limit", "message": message}
+            ), 400
+
+        session = SessionLocal()
+        monitor = session.get(Monitor, monitor_id)
+        if monitor is None:
+            return jsonify(
+                {"error": "not_found", "message": f"No monitor with id {monitor_id}"}
+            ), 404
+
+        rows = session.execute(
+            select(CheckResultRow)
+            .where(CheckResultRow.monitor_id == monitor_id)
+            .order_by(CheckResultRow.checked_at.desc(), CheckResultRow.id.desc())
+            .limit(limit)
+        ).scalars().all()
+
+        return jsonify(
+            {
+                "monitor": monitor.to_dict(),
+                "count": len(rows),
+                "results": [r.to_dict() for r in rows],
+            }
+        )
+
+    @app.route("/api/status", methods=["GET"])
+    def status_rollup():
+        """Overall rollup: counts by status, worst severity, last check time.
+
+        "unknown" is counted separately from "fail" and never folded into it.
+        The engine's three-state Status distinguishes "this is broken" from "I
+        could not determine this", and collapsing them here would throw away
+        the one signal that tells an operator whether to fix the service or fix
+        the monitor.
+        """
+        session = SessionLocal()
+        monitors = session.execute(select(Monitor)).scalars().all()
+        grouped = _latest_results(session, [m.id for m in monitors], per_monitor=1)
+
+        counts = {"ok": 0, "fail": 0, "unknown": 0, "pending": 0}
+        severities = []
+        last_checked = None
+
+        for monitor in monitors:
+            results = grouped.get(monitor.id, [])
+            if not results:
+                counts["pending"] += 1
+                continue
+            latest = results[0]
+            counts[latest.status] = counts.get(latest.status, 0) + 1
+            if latest.severity:
+                severities.append(latest.severity)
+            stamp = latest.to_dict()["checked_at"]
+            if last_checked is None or (stamp or "") > last_checked:
+                last_checked = stamp
+
+        if counts["fail"]:
+            overall = "fail"
+        elif counts["unknown"]:
+            overall = "unknown"
+        elif counts["ok"]:
+            overall = "ok"
+        else:
+            overall = "pending"
+
+        return jsonify(
+            {
+                "overall_status": overall,
+                "monitor_count": len(monitors),
+                "counts": counts,
+                "worst_severity": worst_severity(severities),
+                "last_check_at": last_checked,
+            }
+        )
+
+
+def _register_errors(app: Flask) -> None:
+    @app.errorhandler(HTTPException)
+    def handle_http_exception(err: HTTPException):
+        """Client-side errors answered as what they actually are.
+
+        Ported from api-debugging-toolkit, and the single most important handler
+        in the file. Without it the catch-all below swallows every werkzeug
+        HTTPException and turns a routine 404 into a 500: the client is told the
+        server broke, and the service's own error-rate metric climbs on what was
+        really a typo'd URL. In a monitoring tool that is doubly bad, because
+        the thing watching this service would alert on it.
+        """
+        return jsonify(
+            {
+                "error": (err.name or "error").lower().replace(" ", "_"),
+                "message": err.description,
+                "request_id": g.get("request_id", "unknown"),
+            }
+        ), (err.code or 500)
+
+    @app.errorhandler(Exception)
+    def handle_uncaught(err: Exception):
+        del err  # logged via exc_info; Flask requires the parameter
+        logger.exception(
+            "unhandled_exception", extra={"request_id": g.get("request_id", "unknown")}
+        )
+        return jsonify(
+            {"error": "internal_server_error", "request_id": g.get("request_id", "unknown")}
+        ), 500
+
+
+def _register_cli(app: Flask) -> None:
+    @app.cli.command("seed")
+    def seed_command():
+        """Insert the demo monitors. Idempotent, safe to run more than once."""
+        added = seed_monitors()
+        print(f"Seeded {added} new monitor(s).")
+
+    @app.cli.command("check-now")
+    def check_now_command():
+        """Run every enabled monitor once, right now, and record the results."""
+        from apihealthchecker.scheduler import run_due_checks
+
+        rows = run_due_checks()
+        print(f"Recorded {len(rows)} result(s).")
+
+
+if __name__ == "__main__":
+    create_app().run(
+        host=os.environ.get("HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "8080")),
+        debug=os.environ.get("FLASK_DEBUG") == "1",
+    )

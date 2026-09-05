@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>apihealthchecker</title>
+<style>
+/* Everything is inline on purpose: no CDN, no build step, no external font.
+   The page has to render correctly on a machine with no internet access,
+   which for a monitoring tool is not a hypothetical situation. */
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f8;
+  --panel: #ffffff;
+  --panel-2: #fafafb;
+  --border: #e2e2e6;
+  --border-strong: #d2d2d9;
+  --track: #e8e8ec;
+  --text: #16161a;
+  --muted: #6b6b76;
+  --ok: #1a8a4a;
+  --ok-bg: #e7f5ed;
+  --fail: #c62828;
+  --fail-bg: #fdeaea;
+  --unknown: #a06000;
+  --unknown-bg: #fdf3e2;
+  --pending: #6b6b76;
+  --pending-bg: #eeeef1;
+  --accent: #2f5fd0;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101014;
+    --panel: #1a1a20;
+    --panel-2: #16161b;
+    --border: #2c2c36;
+    --border-strong: #3a3a46;
+    --track: #26262f;
+    --text: #ececf0;
+    --muted: #9a9aa8;
+    --ok: #4ade80;
+    --ok-bg: #11301f;
+    --fail: #f87171;
+    --fail-bg: #331616;
+    --unknown: #fbbf24;
+    --unknown-bg: #332614;
+    --pending: #9a9aa8;
+    --pending-bg: #24242c;
+    --accent: #7aa2f7;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+.wrap { max-width: 1240px; margin: 0 auto; padding: 20px 20px 32px; }
+
+/* Header sits on one line with the tagline, so the masthead costs a single
+   row of vertical space instead of three. */
+header {
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
+.tagline { color: var(--muted); font-size: 12.5px; margin: 0; flex: 1 1 300px; }
+
+/* Summary bar: the most important line on the page, so it gets real height,
+   tabular figures at display size, and a left edge tinted by overall state. */
+.rollup {
+  display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--border);
+  border-left: 3px solid var(--pending);
+  border-radius: var(--radius); padding: 12px 18px; margin-bottom: 14px;
+}
+.rollup.ok { border-left-color: var(--ok); }
+.rollup.fail { border-left-color: var(--fail); }
+.rollup.unknown { border-left-color: var(--unknown); }
+.rollup-status { display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 15px; }
+.rollup-meta { display: flex; align-items: baseline; gap: 22px; flex-wrap: wrap; margin-left: auto; }
+.metric { display: flex; align-items: baseline; gap: 6px; font-size: 12px; color: var(--muted); }
+.metric b {
+  font-size: 20px; font-weight: 650; line-height: 1;
+  color: var(--text); font-variant-numeric: tabular-nums;
+}
+/* Zero counts recede; a non-zero failing count is the thing an operator
+   should see first, so it keeps full colour and weight. */
+.metric.zero b { color: var(--muted); font-weight: 500; }
+.metric.zero { opacity: 0.65; }
+.metric.hot b { color: var(--fail); }
+.metric.hot { color: var(--fail); }
+.rollup-time { font-size: 12px; color: var(--muted); }
+
+.dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.dot.ok { background: var(--ok); }
+.dot.fail { background: var(--fail); }
+.dot.unknown { background: var(--unknown); }
+.dot.pending { background: var(--pending); }
+
+/* Two columns at desktop width, one when narrow. Eight monitors then occupy
+   four rows rather than eight, which is what makes the whole system visible
+   without scrolling. */
+.grid {
+  display: grid; gap: 8px;
+  /* min() keeps the 430px column floor on desktop while letting a single
+     column shrink below it on a phone, rather than forcing a sideways scroll. */
+  grid-template-columns: repeat(auto-fill, minmax(min(430px, 100%), 1fr));
+}
+.card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius); padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 7px;
+}
+.card.ok { border-left-color: var(--ok); }
+.card.unknown { border-left-color: var(--unknown); }
+.card.pending { border-left-color: var(--pending); }
+/* A failing monitor is unmissable: tinted panel and a heavier accent edge. */
+.card.fail { border-left-color: var(--fail); background: var(--fail-bg); border-color: var(--fail-bg); }
+
+.card-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.name {
+  font-weight: 600; font-size: 13.5px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.card-actions { margin-left: auto; display: flex; gap: 6px; flex: none; }
+
+.badge {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 2px 6px; border-radius: 4px; white-space: nowrap; flex: none;
+}
+.badge.ok { color: var(--ok); background: var(--ok-bg); }
+.badge.fail { color: var(--fail); background: var(--fail-bg); }
+.badge.unknown { color: var(--unknown); background: var(--unknown-bg); }
+.badge.pending { color: var(--pending); background: var(--pending-bg); }
+.card.fail .badge.fail { background: var(--panel); }
+.badge.sev { color: var(--fail); background: var(--panel); border: 1px solid var(--fail); }
+
+.target {
+  color: var(--muted); font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+.card-msg {
+  font-size: 11.5px; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.card-msg .sev { color: var(--fail); font-weight: 600; }
+.card.fail .card-msg { color: var(--text); }
+
+/* History strip: a fixed grid of 30 slots, right-aligned so the newest result
+   is always in the same place. Empty slots render as track, which is what
+   makes "3 of 30" read as a young monitor rather than a broken widget. */
+/* The strip and its caption share one row: the caption sits at the left where
+   the eye starts, the bars run to the right edge where the newest result is. */
+.history { display: flex; align-items: flex-end; gap: 12px; margin-top: 2px; }
+.history .spark-foot { padding-bottom: 1px; }
+.spark {
+  display: flex; gap: 2px; align-items: flex-end; justify-content: flex-end;
+  height: 32px; margin-left: auto; flex: none;
+}
+.spark i {
+  display: block; width: 7px; flex: none; border-radius: 1px;
+  background: var(--track); height: 100%;
+}
+.spark i.slot { height: 6px; opacity: 0.7; }
+.spark i.ok { background: var(--ok); }
+.spark i.fail { background: var(--fail); }
+.spark i.unknown { background: var(--unknown); }
+.spark i.pending { background: var(--pending); }
+.spark-foot {
+  display: flex; flex-direction: column; gap: 2px;
+  font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+button {
+  font: inherit; font-size: 12px; cursor: pointer;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: 6px; padding: 3px 8px;
+}
+button:hover { border-color: var(--accent); color: var(--accent); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+button:disabled { opacity: 0.5; cursor: default; }
+button.danger:hover { border-color: var(--fail); color: var(--fail); }
+
+/* The add form is a secondary action, so it stays collapsed behind a button
+   and costs one row of height until it is wanted. */
+.bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 14px 0 8px;
+}
+.bar h2 { margin: 0; }
+h2 {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--muted); font-weight: 700;
+}
+.count { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.bar .spacer { margin-left: auto; }
+
+form.add {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 12px; margin: 0 0 8px;
+  display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;
+}
+form.add[hidden] { display: none; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+.field input {
+  font: inherit; font-size: 13px; padding: 5px 8px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: 6px;
+}
+.field.grow { flex: 1 1 240px; }
+.field.grow input { width: 100%; }
+form.add button[type="submit"] {
+  background: var(--accent); color: #fff; border-color: var(--accent); padding: 6px 14px;
+}
+form.add button[type="submit"]:hover { opacity: 0.9; color: #fff; }
+
+.notice { font-size: 12.5px; margin: 0 0 8px; padding: 7px 11px; border-radius: 6px; }
+.notice.err { color: var(--fail); background: var(--fail-bg); }
+.notice.ok { color: var(--ok); background: var(--ok-bg); }
+.empty {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px; color: var(--muted); font-size: 13px;
+}
+
+footer { margin-top: 16px; font-size: 11.5px; color: var(--muted); }
+footer a { color: var(--accent); }
+
+/* On a phone the full 30-slot strip is wider than the viewport, so the strip
+   is allowed to clip from its left (oldest) edge. The newest results, which
+   are the ones worth seeing on a small screen, stay visible on the right. */
+@media (max-width: 520px) {
+  .wrap { padding: 14px 12px 24px; }
+  .history { gap: 8px; }
+  .spark { overflow: hidden; min-width: 0; flex: 0 1 auto; }
+  .rollup { gap: 12px; }
+  .rollup-meta { gap: 14px; }
+}
+
+/* Reduced-motion users get no transitions; there are few, but the ones there
+   are should not fire for them. */
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>apihealthchecker</h1>
+    <p class="tagline">
+      Continuous checks against HTTP endpoints and AWS resources, with failures
+      classified by category and severity.
+    </p>
+  </header>
+
+  <section class="rollup" id="rollup" aria-live="polite">
+    <div class="rollup-status"><span class="dot pending"></span><span>Loading</span></div>
+  </section>
+
+  <div id="notice" role="status"></div>
+
+  <div class="bar">
+    <h2>Monitors</h2>
+    <span class="count" id="monitor-count"></span>
+    <span class="spacer"></span>
+    <button type="button" id="add-toggle" aria-expanded="false" aria-controls="add-form">Add monitor</button>
+  </div>
+
+  <form class="add" id="add-form" hidden>
+    <div class="field grow">
+      <label for="f-name">Name</label>
+      <input id="f-name" name="name" placeholder="Payments API" required>
+    </div>
+    <div class="field grow">
+      <label for="f-target">Target URL</label>
+      <input id="f-target" name="target" placeholder="https://api.example.org/health" required>
+    </div>
+    <div class="field">
+      <label for="f-interval">Interval (s)</label>
+      <input id="f-interval" name="interval_seconds" type="number" value="60" min="10" max="86400" style="width:96px">
+    </div>
+    <button type="submit">Add</button>
+    <button type="button" id="add-cancel">Cancel</button>
+  </form>
+
+  <div class="grid" id="monitors"></div>
+
+  <footer>
+    Auto-refreshing every 15 seconds.
+    Composed from
+    <a href="https://github.com/alexander-constanza/infra-health-check">infra-health-check</a>,
+    <a href="https://github.com/alexander-constanza/api-debugging-toolkit">api-debugging-toolkit</a>
+    and
+    <a href="https://github.com/alexander-constanza/ticket-triage-assistant">ticket-triage-assistant</a>.
+  </footer>
+
+</div>
+
+<script>
+"use strict";
+
+var REFRESH_MS = 15000;
+// Matches SPARKLINE_POINTS in app.py: the API returns at most this many
+// results per monitor, and the strip reserves a slot for each one.
+var SLOTS = 30;
+
+function el(tag, cls, text) {
+  var node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  return node;
+}
+
+function notify(message, kind) {
+  var box = document.getElementById("notice");
+  box.innerHTML = "";
+  if (!message) return;
+  box.appendChild(el("div", "notice " + (kind || "err"), message));
+}
+
+// Relative time, computed client-side so it stays correct between refreshes
+// without the server having to render a moving target.
+function relativeTime(iso) {
+  if (!iso) return "never";
+  var then = Date.parse(iso);
+  if (isNaN(then)) return "unknown";
+  var secs = Math.round((Date.now() - then) / 1000);
+  if (secs < 0) secs = 0;
+  if (secs < 10) return "just now";
+  if (secs < 60) return secs + "s ago";
+  if (secs < 3600) return Math.floor(secs / 60) + "m ago";
+  if (secs < 86400) return Math.floor(secs / 3600) + "h ago";
+  return Math.floor(secs / 86400) + "d ago";
+}
+
+function clockTime(iso) {
+  if (!iso) return "unknown time";
+  var when = new Date(iso);
+  if (isNaN(when.getTime())) return "unknown time";
+  return when.toLocaleString();
+}
+
+function latencyText(ms) {
+  if (ms === null || ms === undefined) return "no latency";
+  if (ms < 1000) return Math.round(ms) + " ms";
+  return (ms / 1000).toFixed(2) + " s";
+}
+
+function statusClass(status) {
+  return ["ok", "fail", "unknown", "pending"].indexOf(status) >= 0 ? status : "pending";
+}
+
+// Failing first, then unknown, then pending, then ok. An operator scans for
+// problems, so problems go to the top. Ties keep API order (monitor id), which
+// makes the sort stable and the layout steady across refreshes.
+var STATUS_RANK = { fail: 0, unknown: 1, pending: 2, ok: 3 };
+
+function sortForOperator(monitors) {
+  var indexed = monitors.map(function (m, i) { return { m: m, i: i }; });
+  indexed.sort(function (a, b) {
+    var ra = STATUS_RANK[statusClass(a.m.status)];
+    var rb = STATUS_RANK[statusClass(b.m.status)];
+    if (ra !== rb) return ra - rb;
+    return a.i - b.i;
+  });
+  return indexed.map(function (entry) { return entry.m; });
+}
+
+/* The history strip.
+
+   Thirty fixed-width slots, right-aligned, so the newest result always lands
+   in the same column and a monitor with three results reads as "3 of 30"
+   rather than as a broken element. Empty slots are drawn as short track marks.
+
+   Bar height encodes latency against the slowest result in the window, with a
+   floor so a fast check is still a visible bar. Failures are drawn full height
+   in red: a failure often has no latency at all, and an invisible bar is
+   exactly the wrong way to render one. */
+function sparkline(history) {
+  var points = history || [];
+  var max = 1;
+  var i;
+  for (i = 0; i < points.length; i++) {
+    var v = points[i].latency_ms;
+    if (typeof v === "number" && v > max) max = v;
+  }
+
+  var strip = el("div", "spark");
+  strip.setAttribute("role", "img");
+  strip.setAttribute(
+    "aria-label",
+    points.length
+      ? "Last " + points.length + " of " + SLOTS + " checks, oldest to newest"
+      : "No checks recorded yet"
+  );
+
+  var empty = SLOTS - points.length;
+  if (empty < 0) empty = 0;
+  for (i = 0; i < empty; i++) {
+    strip.appendChild(el("i", "slot"));
+  }
+
+  var shown = points.slice(-SLOTS);
+  for (i = 0; i < shown.length; i++) {
+    var point = shown[i];
+    var state = statusClass(point.status);
+    var bar = el("i", state);
+    var lat = typeof point.latency_ms === "number" ? point.latency_ms : null;
+    var pct = state === "ok" && lat !== null
+      ? Math.max(25, Math.round((lat / max) * 100))
+      : 100;
+    bar.style.height = pct + "%";
+    bar.title = state + ", " + latencyText(lat) + ", " + clockTime(point.checked_at);
+    strip.appendChild(bar);
+  }
+  return strip;
+}
+
+function monitorCard(m) {
+  var state = statusClass(m.status);
+  var card = el("article", "card " + state);
+
+  var top = el("div", "card-top");
+  top.appendChild(el("span", "dot " + state));
+  top.appendChild(el("span", "name", m.name));
+  // The text label stays next to the dot: status is never carried by colour
+  // alone.
+  top.appendChild(el("span", "badge " + state, m.status));
+  if (state === "fail" && m.severity) {
+    top.appendChild(el("span", "badge sev", m.severity));
+  }
+
+  var actions = el("div", "card-actions");
+  var checkBtn = el("button", null, "Check");
+  checkBtn.type = "button";
+  checkBtn.setAttribute("aria-label", "Check " + m.name + " now");
+  checkBtn.addEventListener("click", function () { checkNow(m.id, checkBtn); });
+  var delBtn = el("button", "danger", "Delete");
+  delBtn.type = "button";
+  delBtn.setAttribute("aria-label", "Delete " + m.name);
+  delBtn.addEventListener("click", function () { removeMonitor(m.id, m.name); });
+  actions.appendChild(checkBtn);
+  actions.appendChild(delBtn);
+  top.appendChild(actions);
+  card.appendChild(top);
+
+  card.appendChild(el("div", "target", m.target));
+
+  var msg = el("div", "card-msg");
+  if (state === "fail" && m.category) {
+    msg.appendChild(el("span", "sev", m.category));
+    msg.appendChild(document.createTextNode(", "));
+  }
+  msg.appendChild(document.createTextNode(
+    (m.message || "") + ", " + latencyText(m.latency_ms) +
+    ", checked " + relativeTime(m.last_checked_at)
+  ));
+  msg.title = msg.textContent;
+  card.appendChild(msg);
+
+  var history = el("div", "history");
+  var count = (m.history || []).length;
+  var foot = el("div", "spark-foot");
+  foot.appendChild(el("span", null, count + " of " + SLOTS + " checks"));
+  foot.appendChild(el("span", null, "every " + m.interval_seconds + "s"));
+  history.appendChild(foot);
+  history.appendChild(sparkline(m.history));
+  card.appendChild(history);
+
+  return card;
+}
+
+function renderRollup(s) {
+  var box = document.getElementById("rollup");
+  box.innerHTML = "";
+  box.className = "rollup " + statusClass(s.overall_status);
+
+  var label = {
+    ok: "All systems reporting healthy",
+    fail: "Failing checks",
+    unknown: "Could not determine",
+    pending: "No checks recorded yet"
+  }[s.overall_status] || s.overall_status;
+
+  var head = el("div", "rollup-status");
+  head.appendChild(el("span", "dot " + statusClass(s.overall_status)));
+  head.appendChild(el("span", null, label));
+  if (s.worst_severity) {
+    head.appendChild(el("span", "badge fail", s.worst_severity));
+  }
+  box.appendChild(head);
+
+  var meta = el("div", "rollup-meta");
+  var counts = s.counts || {};
+  var pairs = [
+    ["ok", counts.ok || 0, false],
+    ["failing", counts.fail || 0, true],
+    ["unknown", counts.unknown || 0, true],
+    ["pending", counts.pending || 0, false]
+  ];
+  for (var i = 0; i < pairs.length; i++) {
+    var value = pairs[i][1];
+    // A count of zero is good news and recedes. A non-zero failing or unknown
+    // count is the thing to look at, so it stays loud.
+    var cls = "metric";
+    if (!value) cls += " zero";
+    else if (pairs[i][2]) cls += " hot";
+    var metric = el("span", cls);
+    metric.appendChild(el("b", null, value));
+    metric.appendChild(el("span", null, pairs[i][0]));
+    meta.appendChild(metric);
+  }
+  meta.appendChild(el("span", "rollup-time", "last check " + relativeTime(s.last_check_at)));
+  box.appendChild(meta);
+}
+
+function readError(response) {
+  return response.json().then(function (body) {
+    if (body && body.fields) return body.error + ": " + body.fields.join(", ");
+    if (body && body.message) return body.message;
+    if (body && body.error) return body.error;
+    return "Request failed with status " + response.status;
+  }).catch(function () {
+    return "Request failed with status " + response.status;
+  });
+}
+
+function refresh() {
+  return Promise.all([
+    fetch("/api/status").then(function (r) { return r.json(); }),
+    fetch("/api/monitors").then(function (r) { return r.json(); })
+  ]).then(function (both) {
+    renderRollup(both[0]);
+    var list = document.getElementById("monitors");
+    list.innerHTML = "";
+    var monitors = (both[1] && both[1].monitors) || [];
+    document.getElementById("monitor-count").textContent =
+      monitors.length ? monitors.length + " tracked" : "";
+    if (!monitors.length) {
+      list.appendChild(el("div", "empty", "No monitors yet. Use Add monitor to create one."));
+      return;
+    }
+    var ordered = sortForOperator(monitors);
+    for (var i = 0; i < ordered.length; i++) {
+      list.appendChild(monitorCard(ordered[i]));
+    }
+  }).catch(function () {
+    notify("Could not reach the service. Retrying on the next refresh.", "err");
+  });
+}
+
+function checkNow(id, button) {
+  button.disabled = true;
+  button.textContent = "...";
+  fetch("/api/monitors/" + id + "/check", { method: "POST" }).then(function (r) {
+    if (!r.ok) return readError(r).then(function (m) { throw new Error(m); });
+    return r.json();
+  }).then(function () {
+    notify("", null);
+    return refresh();
+  }).catch(function (err) {
+    notify(err.message, "err");
+  }).then(function () {
+    button.disabled = false;
+    button.textContent = "Check";
+  });
+}
+
+function removeMonitor(id, name) {
+  if (!window.confirm("Delete monitor \"" + name + "\" and its history?")) return;
+  fetch("/api/monitors/" + id, { method: "DELETE" }).then(function (r) {
+    if (!r.ok) return readError(r).then(function (m) { throw new Error(m); });
+    notify("", null);
+    return refresh();
+  }).catch(function (err) {
+    notify(err.message, "err");
+  });
+}
+
+var addForm = document.getElementById("add-form");
+var addToggle = document.getElementById("add-toggle");
+
+function setAddOpen(open) {
+  addForm.hidden = !open;
+  addToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  addToggle.textContent = open ? "Close" : "Add monitor";
+  if (open) document.getElementById("f-name").focus();
+}
+
+addToggle.addEventListener("click", function () {
+  setAddOpen(addForm.hidden);
+});
+document.getElementById("add-cancel").addEventListener("click", function () {
+  setAddOpen(false);
+  addToggle.focus();
+});
+
+addForm.addEventListener("submit", function (event) {
+  event.preventDefault();
+  var form = event.target;
+  var payload = {
+    name: form.name.value,
+    target: form.target.value,
+    type: "http",
+    interval_seconds: parseInt(form.interval_seconds.value, 10)
+  };
+  fetch("/api/monitors", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }).then(function (r) {
+    if (!r.ok) return readError(r).then(function (m) { throw new Error(m); });
+    return r.json();
+  }).then(function () {
+    form.reset();
+    form.interval_seconds.value = "60";
+    setAddOpen(false);
+    notify("Monitor added.", "ok");
+    return refresh();
+  }).catch(function (err) {
+    notify(err.message, "err");
+  });
+});
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

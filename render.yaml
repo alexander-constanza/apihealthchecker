@@ -1,0 +1,29 @@
+# Render.com configuration, as an alternative to Fly.
+#
+# Same shape as fly.toml: one small instance, a persistent disk for the SQLite
+# file, and DB_PATH pointing inside that disk's mount path. The disk is the part
+# that matters. Render's filesystem is otherwise ephemeral, so without it every
+# deploy starts with an empty database.
+
+services:
+  - type: web
+    name: apihealthchecker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /health
+
+    envVars:
+      - key: PORT
+        value: "8080"
+      # Must sit inside the disk mountPath below.
+      - key: DB_PATH
+        value: /data/apihealthchecker.db
+      - key: SEED_ON_START
+        value: "1"
+
+    disk:
+      name: apihealthchecker-data
+      mountPath: /data
+      sizeGB: 1
