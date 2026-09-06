@@ -176,18 +176,40 @@ def test_nonce_changes_per_request(client):
 # ---- cap under concurrency --------------------------------------------------
 
 
-def test_cap_holds_under_concurrent_visitors(app, sandbox, monkeypatch):
+@pytest.fixture()
+def file_backed_db(tmp_path):
+    """A real SQLite file with a connection per thread, for the one test whose
+    subject is concurrency.
+
+    The suite's in-memory database sits on a single shared connection, which
+    is fine for every other test and useless here: two threads on one
+    connection share one transaction, so a rollback in one silently undoes
+    the other's inserts. Production has a file and a pool, so this does too.
+    """
+    from sqlalchemy import create_engine, event
+
+    from apihealthchecker.db import Base, SessionLocal, engine
+
+    tmp_engine = create_engine(f"sqlite:///{tmp_path / 'race.db'}")
+
+    @event.listens_for(tmp_engine, "connect")
+    def _fk(dbapi_connection, record):
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(bind=tmp_engine)
+    SessionLocal.remove()
+    SessionLocal.configure(bind=tmp_engine)
+    try:
+        yield tmp_engine
+    finally:
+        SessionLocal.remove()
+        SessionLocal.configure(bind=engine)
+        tmp_engine.dispose()
+
+
+def test_cap_holds_under_concurrent_visitors(app, sandbox, file_backed_db):
     """Twelve visitors hit create at the same instant. Exactly three succeed,
-    the rest get a clean 429, and nothing gets a 500 from lock contention.
-
-    The test database is in memory on one shared connection (StaticPool), so
-    a request's session teardown would roll back another thread's transaction
-    mid-flight. That is a property of the test setup, not of the file-backed
-    database in production where each thread has its own connection, so the
-    teardown is a no-op for the duration of this test."""
-    from apihealthchecker.db import SessionLocal
-
-    monkeypatch.setattr(SessionLocal, "remove", lambda: None)
+    the rest get a clean 429, and nothing gets a 500 from lock contention."""
     results = []
     barrier = threading.Barrier(12)
 
@@ -205,7 +227,9 @@ def test_cap_holds_under_concurrent_visitors(app, sandbox, monkeypatch):
 
     assert results.count(201) == 3
     assert results.count(429) == 9
-    assert app.test_client().get("/api/status").get_json()["sandbox"]["additions_remaining"] == 0
+    status = app.test_client().get("/api/status").get_json()
+    assert status["sandbox"]["additions_remaining"] == 0
+    assert status["monitor_count"] == 3
 
 
 # ---- check-now cooldown -----------------------------------------------------
