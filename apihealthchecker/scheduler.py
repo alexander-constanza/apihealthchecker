@@ -57,12 +57,15 @@ exists so that scaling to two workers is a config change and not an incident.
 import atexit
 import logging
 import os
+import secrets
+import socket
 import threading
 import time
 
 from sqlalchemy.exc import SQLAlchemyError
 
 from apihealthchecker.db import Monitor, SchedulerLock, SessionLocal, utcnow
+from apihealthchecker.retention import prune_results
 from apihealthchecker.runner import run_monitors
 
 logger = logging.getLogger("apihealthchecker")
@@ -81,11 +84,29 @@ TICK_SECONDS = 5
 # next to the timeout but not so small that idle workers hammer the lock row.
 STANDBY_RETRY_SECONDS = 15
 
+# How often the owner deletes results older than RETENTION_DAYS. Once an hour
+# is plenty: the table grows by a few rows a minute, and the first tick after
+# a start prunes immediately so a deploy never waits an hour to catch up.
+PRUNE_INTERVAL_SECONDS = 3600
+
 LOCK_ROW_ID = 1
+
+# Generated once per process. Host and pid alone are not unique enough: on Fly
+# the HOSTNAME variable is unset and gunicorn's first worker gets the same pid
+# in every container, so the process that replaced the dead owner after a
+# deploy produced the identical id and reclaimed the lease as a "renewal". It
+# worked, but only by coincidence, and the same coincidence would let two live
+# processes both believe they own the lease.
+_PROCESS_TOKEN = secrets.token_hex(3)
 
 
 def _owner_id() -> str:
-    return f"{os.environ.get('HOSTNAME', 'local')}:{os.getpid()}"
+    host = (
+        os.environ.get("FLY_MACHINE_ID")
+        or os.environ.get("HOSTNAME")
+        or socket.gethostname().split(".")[0]
+    )
+    return f"{host}:{os.getpid()}:{_PROCESS_TOKEN}"
 
 
 def scheduler_enabled() -> bool:
@@ -102,9 +123,8 @@ def scheduler_enabled() -> bool:
 def acquire_lease(session=None, owner: str | None = None, now=None) -> bool:
     """Try to claim the scheduler lease. True if this process owns it.
 
-    Claimable when no row exists, when this process already owns it (so a
-    restart of the same pid reclaims cleanly), or when the current owner's
-    heartbeat has gone stale.
+    Claimable when no row exists, when this process already owns it, or when
+    the current owner's heartbeat has gone stale.
     """
     owner = owner or _owner_id()
     now = now or utcnow()
@@ -270,6 +290,7 @@ class Scheduler:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.owns_lease = False
+        self._last_prune_at = None
 
     def tick(self, now=None) -> list:
         """One iteration: refresh the lease, then run whatever is due.
@@ -283,10 +304,27 @@ class Scheduler:
                 self.owns_lease = False
                 logger.warning("scheduler_lease_lost", extra={"owner": self.owner})
                 return []
-            return run_due_checks(now=now)
+            rows = run_due_checks(now=now)
+            self._maybe_prune(now=now)
+            return rows
         except Exception:
             logger.exception("scheduler_tick_failed", extra={"owner": self.owner})
             return []
+
+    def _maybe_prune(self, now=None) -> int:
+        """Apply the retention policy, at most once per PRUNE_INTERVAL_SECONDS.
+
+        Runs on the owner only, as part of its tick, so there is exactly one
+        process deleting and it is the same one that is writing.
+        """
+        now = now or utcnow()
+        if (
+            self._last_prune_at is not None
+            and _age_seconds(self._last_prune_at, now) < PRUNE_INTERVAL_SECONDS
+        ):
+            return 0
+        self._last_prune_at = now
+        return prune_results(now=now)
 
     def standby_tick(self, now=None) -> bool:
         """One standby iteration: retry the lease claim. True once this process owns it.
@@ -317,9 +355,11 @@ class Scheduler:
                 self.tick()
                 self._stop.wait(self.tick_seconds)
             else:
-                self.standby_tick()
-                if not self.owns_lease:
-                    self._stop.wait(self.standby_retry_seconds)
+                # Wait first: start() has just tried the claim, so an immediate
+                # retry would only log the same refusal twice.
+                self._stop.wait(self.standby_retry_seconds)
+                if not self._stop.is_set():
+                    self.standby_tick()
 
     def start(self) -> bool:
         """Start the thread. True if this process owns the lease right now.

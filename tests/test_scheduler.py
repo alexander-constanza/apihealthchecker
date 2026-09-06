@@ -24,6 +24,28 @@ from apihealthchecker.scheduler import (
 )
 
 
+def test_owner_id_is_unique_per_process(monkeypatch):
+    """Host and pid repeat across container restarts (Fly gave the replacement
+    process the dead owner's exact id once), so the id carries a per-process
+    token as well."""
+    from apihealthchecker import scheduler as module
+
+    monkeypatch.setenv("FLY_MACHINE_ID", "287e610c732d58")
+    first = module._owner_id()
+    monkeypatch.setattr(module, "_PROCESS_TOKEN", "other!")
+    second = module._owner_id()
+
+    assert first.startswith("287e610c732d58:")
+    assert first != second
+    assert first.rsplit(":", 1)[0] == second.rsplit(":", 1)[0]
+
+
+def test_a_lookalike_process_cannot_renew_someone_elses_lease(session):
+    now = utcnow()
+    assert acquire_lease(session=session, owner="host:654:aaaaaa", now=now) is True
+    assert acquire_lease(session=session, owner="host:654:bbbbbb", now=now) is False
+
+
 def test_lease_is_acquired_when_unclaimed(session):
     assert acquire_lease(session=session, owner="worker-1") is True
     assert session.get(SchedulerLock, LOCK_ROW_ID).owner == "worker-1"
