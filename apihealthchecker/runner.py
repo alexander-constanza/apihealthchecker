@@ -6,6 +6,8 @@ entries that function already understands, classifies whatever comes back with
 the ported ticket-triage scorer, and writes the results down.
 
 It contains no checking logic and no HTTP logic of its own. That is the point.
+The one addition is a call to the notifier after each batch is committed, so a
+status change becomes a webhook without the runner knowing what a webhook is.
 """
 import logging
 import time
@@ -13,6 +15,7 @@ import time
 from apihealthchecker.classifier import classify_failure
 from apihealthchecker.db import CheckResultRow, Monitor, SessionLocal, utcnow
 from apihealthchecker.engine import Status, run_checks
+from apihealthchecker.notifier import notify_transitions, previous_statuses
 
 logger = logging.getLogger("apihealthchecker")
 
@@ -111,6 +114,8 @@ def run_monitors(monitors: list[Monitor], session=None, max_workers: int = DEFAU
     try:
         entries = [monitor_to_entry(m) for m in monitors]
         monitor_ids = [m.id for m in monitors]
+        # Read before writing: once the new rows are in, "previous" is gone.
+        previous = previous_statuses(session, monitor_ids)
 
         started = time.monotonic()
         results = run_checks(entries, max_workers=max_workers)
@@ -127,10 +132,15 @@ def run_monitors(monitors: list[Monitor], session=None, max_workers: int = DEFAU
         session.commit()
         for row in rows:
             session.refresh(row)
-        return rows
     except Exception:
         session.rollback()
         raise
+    else:
+        # After the commit, on purpose. The webhook is the one network call in
+        # this module that is not a check, and it must not be able to fail a
+        # write or hold the transaction open while it waits.
+        notify_transitions(previous, rows)
+        return rows
     finally:
         if owns_session:
             session.close()

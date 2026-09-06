@@ -23,6 +23,7 @@ from apihealthchecker.db import (
     init_db,
 )
 from apihealthchecker.logging_config import configure_logging
+from apihealthchecker.notifier import webhook_url
 from apihealthchecker.runner import run_single
 from apihealthchecker.scheduler import start_scheduler
 from apihealthchecker.seed import seed_monitors
@@ -217,6 +218,7 @@ def _register_api(app: Flask) -> None:
                     "running_in_this_process": bool(scheduler and scheduler.owns_lease),
                     "owner": scheduler.owner if scheduler else None,
                 },
+                "alerting": {"webhook_configured": webhook_url() is not None},
             }
         ), (200 if db_ok else 503)
 
