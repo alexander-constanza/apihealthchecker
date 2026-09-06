@@ -7,7 +7,9 @@ A monitoring service that continuously checks HTTP endpoints and AWS resources,
 records every result over time, classifies failures by category and severity,
 and serves a live status page.
 
-**Live demo:** https://apihealthchecker.fly.dev/ ([deployment steps](DEPLOY.md))
+**Live demo:** https://apihealthchecker.fly.dev/ ([deployment steps](DEPLOY.md)).
+Everything is readable. Adding, deleting or re-checking a monitor needs the
+API token, so the demo stays the way it is shown here.
 
 ![Status page screenshot](docs/screenshot.png)
 
@@ -298,6 +300,9 @@ second write path a demo does not need.
 
 Reads are open. When `API_TOKEN` is set, the three write endpoints (`POST` and
 `DELETE`) need `Authorization: Bearer <token>` and answer `401` without it.
+The deployed demo has it set: the status page and every `GET` work for anyone,
+and the write endpoints refuse without the token. Verified from outside with
+`curl`, and `/health` says so.
 The check is a `before_request` hook keyed on method and path rather than a
 decorator per route, so a write endpoint added later is protected before
 anyone remembers to protect it. One shared token, deliberately: accounts and
@@ -313,7 +318,8 @@ curl localhost:8080/health
   "status": "ok",
   "dependencies": {"database": "ok"},
   "scheduler": {"running_in_this_process": true, "owner": "287e610c732d58:654:158f1c"},
-  "alerting": {"webhook_configured": true}
+  "alerting": {"webhook_configured": true},
+  "auth": {"write_token_required": true}
 }
 ```
 
