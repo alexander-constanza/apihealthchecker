@@ -180,3 +180,49 @@ def test_health_reports_whether_alerting_is_configured(client, monkeypatch):
     assert client.get("/health").get_json()["alerting"]["webhook_configured"] is False
     monkeypatch.setenv("ALERT_WEBHOOK_URL", HOOK)
     assert client.get("/health").get_json()["alerting"]["webhook_configured"] is True
+
+
+@responses.activate
+def test_authorization_header_is_sent_when_configured(session, monitor, monkeypatch):
+    monkeypatch.setenv("ALERT_WEBHOOK_URL", HOOK)
+    monkeypatch.setenv("ALERT_WEBHOOK_AUTHORIZATION", "Bearer receiver-token")
+    _seed_result(session, monitor, "ok")
+    responses.add(responses.GET, monitor.target, status=503)
+    responses.add(responses.POST, HOOK, status=200)
+
+    run_monitors([monitor], session=session)
+
+    sent = _hook_calls()[0].request
+    assert sent.headers["Authorization"] == "Bearer receiver-token"
+    assert "Accept" not in sent.headers or "github" not in sent.headers["Accept"]
+
+
+@responses.activate
+def test_github_format_wraps_the_payload_for_repository_dispatch(session, monitor, monkeypatch):
+    monkeypatch.setenv("ALERT_WEBHOOK_URL", HOOK)
+    monkeypatch.setenv("ALERT_WEBHOOK_FORMAT", "github")
+    _seed_result(session, monitor, "ok")
+    responses.add(responses.GET, monitor.target, status=503)
+    responses.add(responses.POST, HOOK, status=204)
+
+    run_monitors([monitor], session=session)
+
+    sent = _hook_calls()[0].request
+    body = json.loads(sent.body)
+    assert body["event_type"] == "monitor_alert"
+    assert body["client_payload"]["event"] == "monitor_failed"
+    assert body["client_payload"]["monitor"]["id"] == monitor.id
+    assert sent.headers["Accept"] == "application/vnd.github+json"
+
+
+def test_unknown_format_falls_back_to_json(monkeypatch):
+    from apihealthchecker.notifier import webhook_format, wrap_for_format
+
+    monkeypatch.setenv("ALERT_WEBHOOK_FORMAT", "slack")
+    assert webhook_format() == "json"
+    assert wrap_for_format({"event": "x"}) == {"event": "x"}
+
+
+def test_health_reports_the_alert_format(client, monkeypatch):
+    monkeypatch.setenv("ALERT_WEBHOOK_FORMAT", "github")
+    assert client.get("/health").get_json()["alerting"]["format"] == "github"

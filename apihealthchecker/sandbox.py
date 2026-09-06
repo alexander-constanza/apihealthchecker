@@ -41,9 +41,10 @@ from datetime import timedelta
 from urllib.parse import urlsplit
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from apihealthchecker.auth import api_token
-from apihealthchecker.db import Monitor, SandboxEntry, SessionLocal, utcnow
+from apihealthchecker.db import Monitor, SandboxEntry, SandboxSlot, SessionLocal, utcnow
 
 logger = logging.getLogger("apihealthchecker")
 
@@ -52,11 +53,11 @@ DEFAULT_TTL_HOURS = 24
 DEFAULT_CHECK_COOLDOWN_SECONDS = 30
 MIN_VISITOR_INTERVAL_SECONDS = 60
 
-# The cap is checked and then the row is inserted. Two visitors doing that at
-# the same moment could both pass the check, and with SQLite the loser tends
-# to hit a lock error rather than a clean 429. The deployment is one process,
-# so a process lock makes count-then-insert atomic. A second process would
-# need the check moved into the database; see the README.
+# Two layers hold the cap. The unique index on sandbox_slots (day, slot) is
+# the guarantee: the database refuses a second claim on the same number, from
+# any process. This lock is the polite layer on top: within one process it
+# stops visitors racing into that refusal and turns what would be a retry
+# into a queue. Either alone would do; both together are cheap.
 create_lock = threading.Lock()
 
 # monitor id -> monotonic time of the last visitor check-now. Also per process.
@@ -245,13 +246,39 @@ def next_reset(now=None):
     return start_of_day(now) + timedelta(days=1)
 
 
+def day_key(now=None) -> str:
+    return start_of_day(now).strftime("%Y-%m-%d")
+
+
 def additions_today(session, now=None) -> int:
-    """Visitor monitors created since midnight UTC, whether or not they still exist."""
+    """Slots claimed since midnight UTC, whether or not the monitors still exist."""
     return session.execute(
-        select(func.count())
-        .select_from(SandboxEntry)
-        .where(SandboxEntry.created_at >= start_of_day(now))
+        select(func.count()).select_from(SandboxSlot).where(SandboxSlot.day == day_key(now))
     ).scalar_one()
+
+
+def claim_slot(session, now=None) -> bool:
+    """Take the next numbered slot for today. False when the day is full.
+
+    Count, then insert slot number `count`. If another process took that
+    number in between, the unique index raises, the insert is rolled back,
+    and the count is taken again. The slot is committed on its own before the
+    monitor is written, so a create that fails after this point has still
+    used a slot. That is the cheap direction to be wrong in.
+    """
+    limit = max_per_day()
+    for _ in range(limit + 2):
+        taken = additions_today(session, now=now)
+        if taken >= limit:
+            return False
+        session.add(SandboxSlot(day=day_key(now), slot=taken, created_at=now or utcnow()))
+        try:
+            session.commit()
+            return True
+        except IntegrityError:
+            session.rollback()
+            logger.info("sandbox_slot_contended", extra={"slot": taken})
+    return False
 
 
 def additions_remaining(session, now=None) -> int:

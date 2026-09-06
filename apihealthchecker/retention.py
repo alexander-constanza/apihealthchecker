@@ -5,11 +5,10 @@ minute each) that is about 11,500 rows a day, which SQLite handles for years,
 but a real deployment with more monitors or shorter intervals needs a bound. The
 scheduler calls `prune_results` once an hour from its tick.
 
-This is deletion, not rollup. Rows older than the window are gone, and nothing
-downsampled replaces them, so "uptime over the last year" is not a question this
-database can answer once the window is shorter than a year. A rollup table is
-the obvious next step and was left out deliberately: it is a second write path
-with its own consistency questions, and a demo does not need it.
+This is deletion. What survives it is `daily_rollups`, written by rollup.py in
+the same maintenance pass, before this runs: one row per monitor per day with
+counts and latency. "Uptime over the last year" is answered from those; the
+individual results are gone.
 
 RETENTION_DAYS=0 disables pruning entirely.
 """

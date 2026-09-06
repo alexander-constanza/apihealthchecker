@@ -4,13 +4,18 @@ SQLAlchemy so the same code runs against a file-backed SQLite database (local
 dev, and the Fly volume in production) or an in-memory one (tests), controlled
 entirely by DATABASE_URL.
 
-Four tables:
+Six tables:
 - monitors: what to check, and how often.
-- check_results: every result ever recorded, the history behind the sparklines.
+- check_results: every result recorded inside the retention window, the
+  history behind the sparklines.
+- daily_rollups: one row per monitor per day, counts and latency, kept after
+  the results behind it are pruned. See rollup.py.
 - scheduler_lock: a single row used as a cross-process lease so exactly one
   gunicorn worker runs the scheduler. See scheduler.py for why.
 - sandbox_entries: which monitors a visitor added in sandbox mode, and when
   each one expires. See sandbox.py.
+- sandbox_slots: one row per visitor addition per day, unique on (day, slot),
+  so the daily cap is enforced by the database and not by a lock.
 """
 import os
 from datetime import UTC, datetime
@@ -25,6 +30,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     event,
 )
@@ -187,6 +193,63 @@ class SchedulerLock(Base):
     id = Column(Integer, primary_key=True)
     owner = Column(String(100), nullable=False)
     heartbeat_at = Column(DateTime, nullable=False, default=utcnow)
+
+
+class DailyRollup(Base):
+    """One monitor's day, summarised.
+
+    Written by the scheduler's hourly maintenance from the rows in
+    check_results, and kept after those rows are pruned. This is what makes
+    "uptime over the last 90 days" answerable when results are only kept for
+    30. Latency is the mean and the maximum for the day, which is what a
+    status page needs; percentiles would need the rows, and the rows are gone.
+    """
+
+    __tablename__ = "daily_rollups"
+    __table_args__ = (UniqueConstraint("monitor_id", "day", name="uq_daily_rollup"),)
+
+    id = Column(Integer, primary_key=True)
+    monitor_id = Column(
+        Integer, ForeignKey("monitors.id", ondelete="CASCADE"), nullable=False
+    )
+    day = Column(String(10), nullable=False)  # YYYY-MM-DD, UTC
+    checks = Column(Integer, nullable=False, default=0)
+    ok = Column(Integer, nullable=False, default=0)
+    fail = Column(Integer, nullable=False, default=0)
+    unknown = Column(Integer, nullable=False, default=0)
+    latency_avg_ms = Column(Float, nullable=True)
+    latency_max_ms = Column(Float, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=utcnow)
+
+    def to_dict(self) -> dict:
+        return {
+            "day": self.day,
+            "checks": self.checks,
+            "ok": self.ok,
+            "fail": self.fail,
+            "unknown": self.unknown,
+            "latency_avg_ms": self.latency_avg_ms,
+            "latency_max_ms": self.latency_max_ms,
+        }
+
+
+class SandboxSlot(Base):
+    """One visitor addition on one day. The unique index is the cap.
+
+    A count-then-insert can be raced. Two processes that both count two and
+    both insert would give four monitors on a cap of three. Here each addition
+    claims a numbered slot for the day, and the database refuses the second
+    claim on the same number, so the cap holds however many processes there
+    are. Rows are never deleted: three per day at most.
+    """
+
+    __tablename__ = "sandbox_slots"
+    __table_args__ = (UniqueConstraint("day", "slot", name="uq_sandbox_slot"),)
+
+    id = Column(Integer, primary_key=True)
+    day = Column(String(10), nullable=False)
+    slot = Column(Integer, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
 
 
 class SandboxEntry(Base):

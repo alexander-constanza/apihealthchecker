@@ -91,13 +91,13 @@ def test_cap_is_three_per_day_and_counts_deletions(client, sandbox):
 
 
 def test_cap_resets_at_midnight_utc(session, sandbox):
+    from apihealthchecker.db import SandboxSlot
+
     now = datetime(2026, 9, 6, 10, 0, tzinfo=UTC)
-    yesterday = datetime(2026, 9, 5, 23, 59, tzinfo=UTC)
-    today = datetime(2026, 9, 6, 0, 1, tzinfo=UTC)
     session.add_all(
         [
-            SandboxEntry(monitor_id=None, created_at=yesterday, expires_at=yesterday),
-            SandboxEntry(monitor_id=None, created_at=today, expires_at=today),
+            SandboxSlot(day="2026-09-05", slot=0),
+            SandboxSlot(day="2026-09-06", slot=0),
         ]
     )
     session.commit()
@@ -235,3 +235,54 @@ def test_ttl_and_cap_are_configurable(client, sandbox, monkeypatch):
     assert client.post("/api/monitors", json={**NEW, "name": "second"}).status_code == 429
     sb = client.get("/api/status").get_json()["sandbox"]
     assert sb["ttl_hours"] == 2 and sb["max_per_day"] == 1
+
+
+def test_slot_claims_are_unique_per_day(session, sandbox):
+    """The database, not a lock, is what stops two processes both taking slot 2."""
+    import pytest as _pytest
+    from sqlalchemy.exc import IntegrityError
+
+    from apihealthchecker.db import SandboxSlot
+
+    session.add(SandboxSlot(day="2026-09-06", slot=0))
+    session.commit()
+    session.add(SandboxSlot(day="2026-09-06", slot=0))
+    with _pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+    session.add(SandboxSlot(day="2026-09-07", slot=0))
+    session.commit()
+
+
+def test_claim_slot_retries_after_a_contended_number(session, sandbox, monkeypatch):
+    """Simulate another process taking slot 0 between the count and the insert:
+    the first count lies and says 0, the row for 0 already exists, the claim
+    must fall back to a real count and take slot 1."""
+    from apihealthchecker import sandbox as module
+    from apihealthchecker.db import SandboxSlot
+
+    now = utcnow()
+    session.add(SandboxSlot(day=module.day_key(now), slot=0, created_at=now))
+    session.commit()
+
+    real = module.additions_today
+    calls = {"n": 0}
+
+    def lying_count(sess, now=None):
+        calls["n"] += 1
+        return 0 if calls["n"] == 1 else real(sess, now=now)
+
+    monkeypatch.setattr(module, "additions_today", lying_count)
+    assert module.claim_slot(session, now=now) is True
+    slots = sorted(s.slot for s in session.query(SandboxSlot).all())
+    assert slots == [0, 1]
+    assert calls["n"] == 2
+
+
+def test_claim_slot_refuses_a_full_day(session, sandbox):
+    from apihealthchecker import sandbox as module
+
+    now = utcnow()
+    for _ in range(3):
+        assert module.claim_slot(session, now=now) is True
+    assert module.claim_slot(session, now=now) is False

@@ -17,6 +17,15 @@ at anything that accepts JSON, or at a small adapter in front of the thing you
 actually page with. There are no retries and no queue: a webhook that is down
 when the transition happens misses it, and the miss is logged as `alert_failed`.
 
+Two knobs, because most real receivers need them:
+
+- ALERT_WEBHOOK_AUTHORIZATION is sent as the Authorization header, verbatim.
+- ALERT_WEBHOOK_FORMAT=github wraps the payload the way GitHub's
+  repository_dispatch endpoint wants it, `{"event_type": "monitor_alert",
+  "client_payload": {...}}`, so the receiver can be a repository and a
+  workflow can turn each alert into an issue. That is what the deployed demo
+  does; see `.github/workflows/alerts.yml`. The payload itself is unchanged.
+
 Every transition is also logged as `monitor_status_changed` whether or not a
 webhook is configured, so the history of flips is in the logs either way.
 """
@@ -45,6 +54,31 @@ def webhook_url() -> str | None:
     """ALERT_WEBHOOK_URL from the environment, or None when alerting is off."""
     url = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
     return url or None
+
+
+def webhook_format() -> str:
+    """'json' (the payload as the body) or 'github' (wrapped for repository_dispatch)."""
+    value = os.environ.get("ALERT_WEBHOOK_FORMAT", "json").strip().lower() or "json"
+    if value not in ("json", "github"):
+        logger.warning("alert_format_unknown", extra={"value": value})
+        return "json"
+    return value
+
+
+def webhook_headers() -> dict:
+    headers = {}
+    authorization = os.environ.get("ALERT_WEBHOOK_AUTHORIZATION", "").strip()
+    if authorization:
+        headers["Authorization"] = authorization
+    if webhook_format() == "github":
+        headers["Accept"] = "application/vnd.github+json"
+    return headers
+
+
+def wrap_for_format(payload: dict) -> dict:
+    if webhook_format() == "github":
+        return {"event_type": "monitor_alert", "client_payload": payload}
+    return payload
 
 
 def latest_status(session, monitor_id: int) -> str | None:
@@ -93,7 +127,9 @@ def send_alert(payload: dict, url: str | None = None, timeout: float = ALERT_TIM
         return False
     fields = {"event": payload["event"], "monitor_id": payload["monitor"]["id"]}
     try:
-        response = requests.post(url, json=payload, timeout=timeout)
+        response = requests.post(
+            url, json=wrap_for_format(payload), headers=webhook_headers(), timeout=timeout
+        )
         response.raise_for_status()
     except requests.RequestException as exc:
         # No exc_info here on purpose. A requests traceback quotes the URL,

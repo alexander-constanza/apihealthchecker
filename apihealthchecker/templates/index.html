@@ -480,12 +480,22 @@ function monitorCard(m) {
   var count = (m.history || []).length;
   var foot = el("div", "spark-foot");
   foot.appendChild(el("span", null, count + " of " + SLOTS + " checks"));
+  foot.appendChild(el("span", null, uptimeText(m.uptime)));
   foot.appendChild(el("span", null, "every " + m.interval_seconds + "s"));
   history.appendChild(foot);
   history.appendChild(sparkline(m.history));
   card.appendChild(history);
 
   return card;
+}
+
+// From the daily rollups, which the scheduler refreshes hourly, so today's
+// share of the figure can lag by up to an hour. Unknown results are left out
+// of the ratio: "could not determine" is not an outage.
+function uptimeText(u) {
+  if (!u || u.percent === null || u.percent === undefined) return "uptime n/a";
+  var span = u.days_with_data === 1 ? "1 day" : u.days_with_data + " days";
+  return "uptime " + u.percent.toFixed(u.percent === 100 ? 0 : 1) + "% over " + span;
 }
 
 function renderSandbox(sb) {

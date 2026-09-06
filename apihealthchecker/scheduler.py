@@ -66,6 +66,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from apihealthchecker.db import Monitor, SchedulerLock, SessionLocal, utcnow
 from apihealthchecker.retention import prune_results
+from apihealthchecker.rollup import rollup_results
 from apihealthchecker.runner import run_monitors
 from apihealthchecker.sandbox import expire_sandbox_monitors
 
@@ -85,9 +86,9 @@ TICK_SECONDS = 5
 # next to the timeout but not so small that idle workers hammer the lock row.
 STANDBY_RETRY_SECONDS = 15
 
-# How often the owner deletes results older than RETENTION_DAYS. Once an hour
-# is plenty: the table grows by a few rows a minute, and the first tick after
-# a start prunes immediately so a deploy never waits an hour to catch up.
+# How often the owner runs maintenance: rollups first, then deleting results
+# older than RETENTION_DAYS. Once an hour is plenty, and the first tick after
+# a start runs it immediately so a deploy never waits an hour to catch up.
 PRUNE_INTERVAL_SECONDS = 3600
 
 LOCK_ROW_ID = 1
@@ -314,10 +315,11 @@ class Scheduler:
             return []
 
     def _maybe_prune(self, now=None) -> int:
-        """Apply the retention policy, at most once per PRUNE_INTERVAL_SECONDS.
+        """Hourly maintenance: roll up, then prune. Returns rows pruned.
 
         Runs on the owner only, as part of its tick, so there is exactly one
-        process deleting and it is the same one that is writing.
+        process writing summaries and deleting, and it is the same one that
+        is recording. Rollup runs first so no day is deleted unsummarised.
         """
         now = now or utcnow()
         if (
@@ -326,6 +328,7 @@ class Scheduler:
         ):
             return 0
         self._last_prune_at = now
+        rollup_results(now=now)
         return prune_results(now=now)
 
     def standby_tick(self, now=None) -> bool:

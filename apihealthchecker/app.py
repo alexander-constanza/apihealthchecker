@@ -26,6 +26,7 @@ from apihealthchecker.auth import (
 from apihealthchecker.classifier import worst_severity
 from apihealthchecker.db import (
     CheckResultRow,
+    DailyRollup,
     Monitor,
     SessionLocal,
     _iso,
@@ -33,11 +34,12 @@ from apihealthchecker.db import (
     init_db,
 )
 from apihealthchecker.logging_config import configure_logging
-from apihealthchecker.notifier import webhook_url
+from apihealthchecker.notifier import webhook_format, webhook_url
+from apihealthchecker.rollup import uptime_for
 from apihealthchecker.runner import run_single
 from apihealthchecker.sandbox import (
-    additions_remaining,
     check_cooldown_remaining,
+    claim_slot,
     create_lock,
     is_protected,
     max_per_day,
@@ -282,11 +284,12 @@ def _get_monitor(session, monitor_id: int):
     return session.get(Monitor, monitor_id)
 
 
-def _monitor_view(monitor: Monitor, results: list, sandbox_entry=None) -> dict:
+def _monitor_view(monitor: Monitor, results: list, sandbox_entry=None, uptime=None) -> dict:
     """A monitor plus its latest state and recent history, as the UI wants it."""
     latest = results[0] if results else None
     view = monitor.to_dict()
     view["sandbox"] = {"expires_at": _iso(sandbox_entry.expires_at)} if sandbox_entry else None
+    view["uptime"] = uptime
     view["status"] = latest.status if latest else "pending"
     view["message"] = latest.message if latest else "No check recorded yet"
     view["category"] = latest.category if latest else None
@@ -325,7 +328,10 @@ def _register_api(app: Flask) -> None:
                     "running_in_this_process": bool(scheduler and scheduler.owns_lease),
                     "owner": scheduler.owner if scheduler else None,
                 },
-                "alerting": {"webhook_configured": webhook_url() is not None},
+                "alerting": {
+                    "webhook_configured": webhook_url() is not None,
+                    "format": webhook_format(),
+                },
                 "auth": {"write_token_required": write_token_required()},
                 "sandbox": {"enabled": sandbox_enabled()},
             }
@@ -338,10 +344,12 @@ def _register_api(app: Flask) -> None:
         ids = [m.id for m in monitors]
         grouped = _latest_results(session, ids)
         entries = sandbox_entries_for(session, ids) if sandbox_enabled() else {}
+        uptimes = uptime_for(session, ids)
         return jsonify(
             {
                 "monitors": [
-                    _monitor_view(m, grouped.get(m.id, []), entries.get(m.id)) for m in monitors
+                    _monitor_view(m, grouped.get(m.id, []), entries.get(m.id), uptimes.get(m.id))
+                    for m in monitors
                 ]
             }
         )
@@ -367,7 +375,7 @@ def _register_api(app: Flask) -> None:
                 return jsonify(body), status
         # Visitors take the lock so the cap check and the insert are one step.
         with create_lock if visitor else contextlib.nullcontext():
-            if visitor and additions_remaining(session) <= 0:
+            if visitor and not claim_slot(session):
                 return jsonify(
                     {
                         "error": "sandbox_limit",
@@ -465,6 +473,28 @@ def _register_api(app: Flask) -> None:
         if row is None:
             return jsonify({"error": "check_failed", "message": "Check produced no result"}), 500
         return jsonify(row.to_dict()), 201
+
+    @app.route("/api/monitors/<int:monitor_id>/rollups", methods=["GET"])
+    def monitor_rollups(monitor_id: int):
+        """One row per day, newest first, kept after the results are pruned."""
+        session = SessionLocal()
+        monitor = _get_monitor(session, monitor_id)
+        if monitor is None:
+            return jsonify(
+                {"error": "not_found", "message": f"No monitor with id {monitor_id}"}
+            ), 404
+        rows = session.execute(
+            select(DailyRollup)
+            .where(DailyRollup.monitor_id == monitor_id)
+            .order_by(DailyRollup.day.desc())
+        ).scalars().all()
+        return jsonify(
+            {
+                "monitor": monitor.to_dict(),
+                "uptime": uptime_for(session, [monitor_id]).get(monitor_id),
+                "days": [r.to_dict() for r in rows],
+            }
+        )
 
     @app.route("/api/monitors/<int:monitor_id>/history", methods=["GET"])
     def monitor_history(monitor_id: int):
