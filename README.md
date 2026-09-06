@@ -287,6 +287,11 @@ without a `text` field. Point this at anything that takes JSON, or at a small
 adapter in front of whatever actually pages you. `GET /health` reports whether
 a webhook is configured, without revealing it.
 
+Alerting is live on the deployed demo. `ALERT_WEBHOOK_URL` is set as a Fly
+secret and points at a request-capture endpoint, so every transition on the
+demo monitors is delivered somewhere and logged as `alert_sent`. It is a
+receiver for looking at payloads, not a pager: nothing wakes anyone up.
+
 **Retention** is `RETENTION_DAYS`, default 30. The scheduler's owner deletes
 `check_results` rows older than that once an hour, and on its first tick after
 a start so a deploy catches up immediately. `0` keeps everything. It is
@@ -318,7 +323,7 @@ curl localhost:8080/health
   "status": "ok",
   "dependencies": {"database": "ok"},
   "scheduler": {"running_in_this_process": true, "owner": "287e610c732d58:654:158f1c"},
-  "alerting": {"webhook_configured": false}
+  "alerting": {"webhook_configured": true}
 }
 ```
 
