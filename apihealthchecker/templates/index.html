@@ -138,6 +138,8 @@ h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
 .badge.pending { color: var(--pending); background: var(--pending-bg); }
 .card.fail .badge.fail { background: var(--panel); }
 .badge.sev { color: var(--fail); background: var(--panel); border: 1px solid var(--fail); }
+.badge.sandbox { color: var(--muted); background: var(--panel); border: 1px dashed var(--muted); }
+.sandbox-note { font-size: 12.5px; color: var(--muted); margin: 0 0 10px; padding: 7px 11px; border: 1px dashed var(--muted); border-radius: 6px; }
 
 .target {
   color: var(--muted); font-size: 11.5px;
@@ -264,6 +266,8 @@ footer a { color: var(--accent); }
   <section class="rollup" id="rollup" aria-live="polite">
     <div class="rollup-status"><span class="dot pending"></span><span>Loading</span></div>
   </section>
+
+  <p class="sandbox-note" id="sandbox-note" hidden></p>
 
   <div id="notice" role="status"></div>
 
@@ -437,6 +441,11 @@ function monitorCard(m) {
   if (state === "fail" && m.severity) {
     top.appendChild(el("span", "badge sev", m.severity));
   }
+  if (m.sandbox && m.sandbox.expires_at) {
+    var tag = el("span", "badge sandbox", "sandbox, " + hoursLeft(m.sandbox.expires_at));
+    tag.title = "Added by a visitor. Removed automatically at " + m.sandbox.expires_at;
+    top.appendChild(tag);
+  }
 
   var actions = el("div", "card-actions");
   var checkBtn = el("button", null, "Check");
@@ -476,6 +485,31 @@ function monitorCard(m) {
   card.appendChild(history);
 
   return card;
+}
+
+function renderSandbox(sb) {
+  var note = document.getElementById("sandbox-note");
+  var interval = document.getElementById("f-interval");
+  if (!sb || !sb.enabled) {
+    note.hidden = true;
+    return;
+  }
+  var left = sb.additions_remaining;
+  note.textContent =
+    "Sandbox: anyone can add a monitor, up to " + sb.max_per_day + " a day across all visitors" +
+    " (" + left + " left right now). Added monitors are removed after " + sb.ttl_hours +
+    " hours. The seeded monitors stay. Targets must be public and check at most every " +
+    sb.min_interval_seconds + " seconds.";
+  note.hidden = false;
+  interval.min = sb.min_interval_seconds;
+  if (parseInt(interval.value, 10) < sb.min_interval_seconds) interval.value = sb.min_interval_seconds;
+}
+
+function hoursLeft(iso) {
+  var ms = new Date(iso).getTime() - Date.now();
+  if (isNaN(ms)) return "";
+  var h = Math.max(Math.ceil(ms / 3600000), 0);
+  return h + "h left";
 }
 
 function renderRollup(s) {
@@ -567,6 +601,7 @@ function refresh() {
     fetch("/api/monitors").then(function (r) { return r.json(); })
   ]).then(function (both) {
     renderRollup(both[0]);
+    renderSandbox(both[0] && both[0].sandbox);
     var list = document.getElementById("monitors");
     list.innerHTML = "";
     var monitors = (both[1] && both[1].monitors) || [];

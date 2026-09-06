@@ -67,6 +67,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from apihealthchecker.db import Monitor, SchedulerLock, SessionLocal, utcnow
 from apihealthchecker.retention import prune_results
 from apihealthchecker.runner import run_monitors
+from apihealthchecker.sandbox import expire_sandbox_monitors
 
 logger = logging.getLogger("apihealthchecker")
 
@@ -305,6 +306,7 @@ class Scheduler:
                 logger.warning("scheduler_lease_lost", extra={"owner": self.owner})
                 return []
             rows = run_due_checks(now=now)
+            expire_sandbox_monitors(now=now)
             self._maybe_prune(now=now)
             return rows
         except Exception:

@@ -15,6 +15,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import HTTPException
 
 from apihealthchecker.auth import (
+    api_token,
     request_is_authorized,
     request_needs_token,
     write_token_required,
@@ -24,12 +25,25 @@ from apihealthchecker.db import (
     CheckResultRow,
     Monitor,
     SessionLocal,
+    _iso,
     check_db_connection,
     init_db,
 )
 from apihealthchecker.logging_config import configure_logging
 from apihealthchecker.notifier import webhook_url
 from apihealthchecker.runner import run_single
+from apihealthchecker.sandbox import (
+    additions_remaining,
+    is_protected,
+    max_per_day,
+    register_sandbox_monitor,
+    sandbox_enabled,
+    sandbox_entries_for,
+    sandbox_requested,
+    sandbox_view,
+    visitor_may,
+    visitor_rejection,
+)
 from apihealthchecker.scheduler import start_scheduler
 from apihealthchecker.seed import seed_monitors
 from apihealthchecker.validation import parse_limit, validate_monitor
@@ -60,6 +74,11 @@ def create_app(start_background_scheduler: bool | None = None) -> Flask:
 
     if os.environ.get("SEED_ON_START", "0") in ("1", "true", "True"):
         seed_monitors()
+
+    if sandbox_requested() and api_token() is None:
+        # Without a token every request is the operator, so there is nobody
+        # for the sandbox rules to apply to. Say so rather than half-enable.
+        logger.warning("sandbox_needs_token")
 
     _register_lifecycle(app)
     _register_api(app)
@@ -105,8 +124,16 @@ def _register_lifecycle(app: Flask) -> None:
 
     @app.before_request
     def require_token_for_writes():
-        """Refuse writes without the token, before any route runs. See auth.py."""
-        if not request_needs_token() or request_is_authorized():
+        """Refuse writes without the token, before any route runs. See auth.py.
+
+        In sandbox mode a visitor may make a short allowlist of writes without
+        it; the routes apply the sandbox rules to those. `g.operator` tells
+        them which kind of caller this is.
+        """
+        g.operator = request_is_authorized()
+        if not request_needs_token() or g.operator:
+            return None
+        if sandbox_enabled() and visitor_may(request.method, request.path):
             return None
         logger.warning(
             "request_unauthorized",
@@ -200,10 +227,11 @@ def _latest_results(session, monitor_ids: list[int], per_monitor: int = SPARKLIN
     return grouped
 
 
-def _monitor_view(monitor: Monitor, results: list) -> dict:
+def _monitor_view(monitor: Monitor, results: list, sandbox_entry=None) -> dict:
     """A monitor plus its latest state and recent history, as the UI wants it."""
     latest = results[0] if results else None
     view = monitor.to_dict()
+    view["sandbox"] = {"expires_at": _iso(sandbox_entry.expires_at)} if sandbox_entry else None
     view["status"] = latest.status if latest else "pending"
     view["message"] = latest.message if latest else "No check recorded yet"
     view["category"] = latest.category if latest else None
@@ -244,6 +272,7 @@ def _register_api(app: Flask) -> None:
                 },
                 "alerting": {"webhook_configured": webhook_url() is not None},
                 "auth": {"write_token_required": write_token_required()},
+                "sandbox": {"enabled": sandbox_enabled()},
             }
         ), (200 if db_ok else 503)
 
@@ -251,9 +280,15 @@ def _register_api(app: Flask) -> None:
     def list_monitors():
         session = SessionLocal()
         monitors = session.execute(select(Monitor).order_by(Monitor.id)).scalars().all()
-        grouped = _latest_results(session, [m.id for m in monitors])
+        ids = [m.id for m in monitors]
+        grouped = _latest_results(session, ids)
+        entries = sandbox_entries_for(session, ids) if sandbox_enabled() else {}
         return jsonify(
-            {"monitors": [_monitor_view(m, grouped.get(m.id, [])) for m in monitors]}
+            {
+                "monitors": [
+                    _monitor_view(m, grouped.get(m.id, []), entries.get(m.id)) for m in monitors
+                ]
+            }
         )
 
     @app.route("/api/monitors", methods=["POST"])
@@ -269,16 +304,40 @@ def _register_api(app: Flask) -> None:
             return jsonify(body), status
 
         session = SessionLocal()
+        visitor = sandbox_enabled() and not g.get("operator", True)
+        if visitor:
+            rejection = visitor_rejection(cleaned)
+            if rejection is not None:
+                body, status = rejection
+                return jsonify(body), status
+            if additions_remaining(session) <= 0:
+                return jsonify(
+                    {
+                        "error": "sandbox_limit",
+                        "message": (
+                            f"The sandbox accepts {max_per_day()} new monitors per day. "
+                            "Try again later."
+                        ),
+                    }
+                ), 429
         try:
             monitor = Monitor(**cleaned)
             session.add(monitor)
+            session.flush()
+            entry = register_sandbox_monitor(session, monitor) if visitor else None
             session.commit()
             session.refresh(monitor)
             logger.info(
                 "monitor_created",
-                extra={"monitor_id": monitor.id, "request_id": g.get("request_id", "unknown")},
+                extra={
+                    "monitor_id": monitor.id,
+                    "sandbox": visitor,
+                    "request_id": g.get("request_id", "unknown"),
+                },
             )
-            return jsonify(monitor.to_dict()), 201
+            body = monitor.to_dict()
+            body["sandbox"] = {"expires_at": _iso(entry.expires_at)} if entry else None
+            return jsonify(body), 201
         except SQLAlchemyError:
             session.rollback()
             logger.exception(
@@ -294,6 +353,14 @@ def _register_api(app: Flask) -> None:
             return jsonify(
                 {"error": "not_found", "message": f"No monitor with id {monitor_id}"}
             ), 404
+        if sandbox_enabled() and not g.get("operator", True) and is_protected(session, monitor_id):
+            return jsonify(
+                {
+                    "error": "protected",
+                    "message": "This monitor is part of the demo. In sandbox mode visitors "
+                    "can only delete monitors that visitors added.",
+                }
+            ), 403
         try:
             session.delete(monitor)
             session.commit()
@@ -398,6 +465,7 @@ def _register_api(app: Flask) -> None:
                 "counts": counts,
                 "worst_severity": worst_severity(severities),
                 "last_check_at": last_checked,
+                "sandbox": sandbox_view(session),
             }
         )
 

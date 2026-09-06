@@ -4,11 +4,13 @@ SQLAlchemy so the same code runs against a file-backed SQLite database (local
 dev, and the Fly volume in production) or an in-memory one (tests), controlled
 entirely by DATABASE_URL.
 
-Three tables:
+Four tables:
 - monitors: what to check, and how often.
 - check_results: every result ever recorded, the history behind the sparklines.
 - scheduler_lock: a single row used as a cross-process lease so exactly one
   gunicorn worker runs the scheduler. See scheduler.py for why.
+- sandbox_entries: which monitors a visitor added in sandbox mode, and when
+  each one expires. See sandbox.py.
 """
 import os
 from datetime import UTC, datetime
@@ -185,6 +187,28 @@ class SchedulerLock(Base):
     id = Column(Integer, primary_key=True)
     owner = Column(String(100), nullable=False)
     heartbeat_at = Column(DateTime, nullable=False, default=utcnow)
+
+
+class SandboxEntry(Base):
+    """One monitor added by a visitor in sandbox mode, and when it goes away.
+
+    A separate table rather than a column on monitors, because `create_all`
+    will create a missing table on an existing database but will not add a
+    column to an existing table, and the deployed database already exists.
+
+    `monitor_id` is nullable and SET NULL on delete, so the row outlives its
+    monitor. The daily cap counts creations, and a row that vanished with its
+    monitor would let add, delete, add again go around the cap.
+    """
+
+    __tablename__ = "sandbox_entries"
+
+    id = Column(Integer, primary_key=True)
+    monitor_id = Column(
+        Integer, ForeignKey("monitors.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(DateTime, nullable=False, default=utcnow)
+    expires_at = Column(DateTime, nullable=False)
 
 
 def _iso(value: datetime | None) -> str | None:
