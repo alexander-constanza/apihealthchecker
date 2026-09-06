@@ -141,9 +141,40 @@ fly logs --no-tail | grep scheduler_
 ```
 
 Useful messages: `scheduler_started` and `scheduler_lease_acquired` (the
-scheduler is running in that process), `scheduler_lease_declined` (a second
-worker correctly stood down), `check_recorded` (one result written),
-`request_completed` (one HTTP request, with `path`, `status` and `duration_ms`).
+scheduler is running in that process), `scheduler_lease_declined` and
+`scheduler_standby` (a second worker correctly stood down and is retrying),
+`check_recorded` (one result written), `monitor_status_changed` (a monitor
+flipped between ok, fail and unknown), `alert_sent` and `alert_failed` (the
+webhook accepted or refused that flip), `results_pruned` (retention ran and
+deleted something), `request_completed` (one HTTP request, with `path`,
+`status` and `duration_ms`).
+
+### Alerting
+
+Alerting is off until `ALERT_WEBHOOK_URL` is set. It is a URL that receives a
+JSON POST on every status change (see "Alerting and retention" in the README
+for the payload). Set it as a secret rather than in `fly.toml`, since webhook
+URLs usually carry a token:
+
+```bash
+fly secrets set ALERT_WEBHOOK_URL=https://example.org/hooks/abc123
+```
+
+Setting a secret restarts the machine. Confirm it took, without exposing it:
+
+```bash
+curl https://<app-name>.fly.dev/health      # "alerting": {"webhook_configured": true}
+```
+
+To see one fire, use the check-now button on a monitor whose status is about to
+change, or add a monitor pointing at a URL that returns 500, then:
+
+```bash
+fly logs --no-tail | grep -E "monitor_status_changed|alert_"
+```
+
+Retention needs nothing set. `RETENTION_DAYS` defaults to 30 and can be changed
+in the `[env]` block of `fly.toml`.
 
 ### Verifying the volume actually persisted
 

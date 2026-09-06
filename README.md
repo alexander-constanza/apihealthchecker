@@ -58,6 +58,7 @@ scheduler tick
   -> CheckResult             status: ok | fail | unknown
   -> classify_failure()      ticket-triage scoring, only if status is fail
   -> check_results row       status + category + severity + latency
+  -> notify_transitions()    webhook POST, only if the status changed
   -> GET /api/status         rollup, worst severity
   -> status page             colour-coded card, sparkline, relative time
 ```
@@ -195,13 +196,20 @@ shares:
 Verified with three real gunicorn workers:
 
 ```
-scheduler_lease_acquired  owner=local:4239  reason=unclaimed
-scheduler_started         owner=local:4239  tick_s=5
-scheduler_lease_declined  owner=local:4240  held_by=local:4239
-scheduler_standby         owner=local:4240  retry_s=15
-scheduler_lease_declined  owner=local:4241  held_by=local:4239
-scheduler_standby         owner=local:4241  retry_s=15
+scheduler_lease_acquired  owner=demo:26802:f8a045  reason=unclaimed
+scheduler_started         owner=demo:26802:f8a045  tick_s=5
+scheduler_lease_declined  owner=demo:26803:500d82  held_by=demo:26802:f8a045
+scheduler_standby         owner=demo:26803:500d82  retry_s=15
+scheduler_lease_declined  owner=demo:26804:3f695f  held_by=demo:26802:f8a045
+scheduler_standby         owner=demo:26804:3f695f  retry_s=15
 ```
+
+An owner id is `host:pid:token`, where the token is random per process. Host
+and pid alone turned out not to be unique: on Fly the replacement container
+after a deploy got the same pid as the one it replaced, produced the identical
+id, and took over the dead owner's lease as though renewing its own. That
+happened to be the right outcome, but for the wrong reason, and the same
+collision would let two live processes both believe they held the lease.
 
 `GET /health` reports which process owns it, so this is observable in production
 rather than a claim in a README.
@@ -229,6 +237,49 @@ that raising the worker count is a config change rather than an incident.
 `APP_ROLE=web` opts a process out entirely, for running the scheduler as its own
 process instead.
 
+## Alerting and retention
+
+Two things a monitoring service has to do that recording and displaying do not
+cover: tell someone, and stop growing.
+
+**Alerting** is one generic webhook. Set `ALERT_WEBHOOK_URL` and every status
+transition is POSTed there as JSON: `ok` to `fail` sends `monitor_failed`,
+`fail` to `ok` sends `monitor_recovered`, anything to `unknown` sends
+`monitor_unknown`. A monitor that stays down sends one alert, not one per
+check. A monitor's very first result sends nothing if it passes and an alert
+if it does not.
+
+```json
+{
+  "event": "monitor_failed",
+  "previous_status": "ok",
+  "status": "fail",
+  "monitor": {"id": 7, "name": "PyPI JSON API", "target": "https://pypi.org/...", "type": "http", ...},
+  "result": {"id": 2811, "status": "fail", "category": "server_error", "severity": "critical", "message": "Responded 503", ...},
+  "sent_at": "2026-09-06T04:20:11+00:00"
+}
+```
+
+The POST happens after the result is committed, never inside the transaction,
+so a slow or dead webhook costs an alert and never a row. There are no retries
+and no queue: `alert_failed` in the logs is the whole record of a missed one.
+Every transition is also logged as `monitor_status_changed` whether or not a
+webhook is set, so the history of flips is in the logs either way.
+
+It is deliberately not a Slack or PagerDuty integration. Those each want their
+own payload shape, and Slack's incoming webhooks in particular reject a body
+without a `text` field. Point this at anything that takes JSON, or at a small
+adapter in front of whatever actually pages you. `GET /health` reports whether
+a webhook is configured, without revealing it.
+
+**Retention** is `RETENTION_DAYS`, default 30. The scheduler's owner deletes
+`check_results` rows older than that once an hour, and on its first tick after
+a start so a deploy catches up immediately. `0` keeps everything. It is
+deletion, not rollup: nothing downsampled replaces what is removed, so "uptime
+over the last year" stops being answerable once the window is shorter than a
+year. A rollup table is the obvious next step and was left out on purpose, as a
+second write path a demo does not need.
+
 ## API
 
 | Method | Path | Purpose |
@@ -251,7 +302,8 @@ curl localhost:8080/health
 {
   "status": "ok",
   "dependencies": {"database": "ok"},
-  "scheduler": {"running_in_this_process": true, "owner": "local:4239"}
+  "scheduler": {"running_in_this_process": true, "owner": "287e610c732d58:654:9c1f2e"},
+  "alerting": {"webhook_configured": false}
 }
 ```
 
@@ -357,6 +409,8 @@ gunicorn --bind 127.0.0.1:8080 --workers 1 --threads 8 \
 | `SEED_ON_START` | `0` | Insert demo monitors at boot. Idempotent |
 | `RUN_SCHEDULER` | `1` | Whether this process tries to run the scheduler |
 | `APP_ROLE` | unset | `web` opts a process out of the scheduler entirely |
+| `RETENTION_DAYS` | `30` | Delete check results older than this, checked hourly by the scheduler. `0` keeps everything |
+| `ALERT_WEBHOOK_URL` | unset | POST a JSON payload here on every monitor status change. Unset means no alerting |
 
 Everything has a working default, so a fresh clone runs with no configuration
 and the same code deploys unchanged.
@@ -385,7 +439,7 @@ pytest -v
 ruff check .
 ```
 
-133 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
+155 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
 scheduler tests pass `now` in explicitly rather than waiting, so a lease can be
 aged past its 90 second timeout without the suite taking 90 seconds.
 
@@ -415,11 +469,12 @@ Honest about what this is not:
 - **No authentication.** Anyone who can reach the service can add, delete and
   trigger monitors. Put it behind an auth proxy before exposing it anywhere that
   matters.
-- **No alerting.** It records and displays state. It does not page anyone. The
-  classified severity is the hook that would feed a notifier.
-- **No retention policy.** `check_results` grows without bound. At this volume
-  it would take years to matter, but a real deployment needs a rollup or a
-  cleanup job.
+- **Alerting is one webhook, fire and forget.** No retries, no queue, no
+  routing by severity, no quiet hours. A flapping monitor alerts on every flip.
+  Enough to wire into a pager through an adapter, not a paging system itself.
+- **Retention is deletion, not rollup.** Rows past `RETENTION_DAYS` are gone
+  and nothing summarised replaces them, so long-range uptime numbers are not
+  answerable from this database.
 - **AWS checks are untested against live AWS.** The engine supports S3 and EC2
   monitors and the API accepts them, but the deployed demo has no AWS
   credentials, so only HTTP monitors are exercised end to end.
