@@ -176,9 +176,18 @@ def test_nonce_changes_per_request(client):
 # ---- cap under concurrency --------------------------------------------------
 
 
-def test_cap_holds_under_concurrent_visitors(app, sandbox):
+def test_cap_holds_under_concurrent_visitors(app, sandbox, monkeypatch):
     """Twelve visitors hit create at the same instant. Exactly three succeed,
-    the rest get a clean 429, and nothing gets a 500 from lock contention."""
+    the rest get a clean 429, and nothing gets a 500 from lock contention.
+
+    The test database is in memory on one shared connection (StaticPool), so
+    a request's session teardown would roll back another thread's transaction
+    mid-flight. That is a property of the test setup, not of the file-backed
+    database in production where each thread has its own connection, so the
+    teardown is a no-op for the duration of this test."""
+    from apihealthchecker.db import SessionLocal
+
+    monkeypatch.setattr(SessionLocal, "remove", lambda: None)
     results = []
     barrier = threading.Barrier(12)
 
