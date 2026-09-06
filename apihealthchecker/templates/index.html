@@ -497,7 +497,7 @@ function renderSandbox(sb) {
   var left = sb.additions_remaining;
   note.textContent =
     "Sandbox: anyone can add a monitor, up to " + sb.max_per_day + " a day across all visitors" +
-    " (" + left + " left right now). Added monitors are removed after " + sb.ttl_hours +
+    " (" + left + " left until midnight UTC). Added monitors are removed after " + sb.ttl_hours +
     " hours. The seeded monitors stay. Targets must be public and check at most every " +
     sb.min_interval_seconds + " seconds.";
   note.hidden = false;

@@ -232,7 +232,7 @@ without one the app logs `sandbox_needs_token` and behaves as if it were off.
 Rules and limits are in the README under "Sandbox mode". Confirm with:
 
 ```bash
-curl -s https://<app-name>.fly.dev/api/status      # "sandbox": {"enabled": true, "additions_remaining": 3, ...}
+curl -s https://<app-name>.fly.dev/api/status      # "sandbox": {"enabled": true, "additions_remaining": 3, "resets_at": ..., ...}
 ```
 
 Expired visitor monitors are removed by the scheduler within seconds of their

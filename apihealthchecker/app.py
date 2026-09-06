@@ -316,7 +316,7 @@ def _register_api(app: Flask) -> None:
                         "error": "sandbox_limit",
                         "message": (
                             f"The sandbox accepts {max_per_day()} new monitors per day. "
-                            "Try again later."
+                            "The count resets at midnight UTC."
                         ),
                     }
                 ), 429

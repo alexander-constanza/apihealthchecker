@@ -292,8 +292,9 @@ With `API_TOKEN` set the demo is safe and the add-monitor form is a
 decoration. Sandbox mode is the middle ground, and it is what the live demo
 runs. Set `SANDBOX=1` alongside `API_TOKEN` and:
 
-- Anyone can add a monitor, up to `SANDBOX_MAX_PER_DAY` (3) in any rolling 24
-  hours across all visitors. The page shows how many are left.
+- Anyone can add a monitor, up to `SANDBOX_MAX_PER_DAY` (3) per day across all
+  visitors. The count resets at midnight UTC, and the page shows how many are
+  left.
 - A visitor's monitor is removed `SANDBOX_TTL_HOURS` (24) after it was added,
   history and all. The card carries a "sandbox, 23h left" tag.
 - Visitors can delete only what visitors added. The seeded eight and anything
@@ -466,7 +467,7 @@ gunicorn --bind 127.0.0.1:8080 --workers 1 --threads 8 \
 | `ALERT_WEBHOOK_URL` | unset | POST a JSON payload here on every monitor status change. Unset means no alerting |
 | `API_TOKEN` | unset | When set, `POST` and `DELETE` under `/api` need `Authorization: Bearer <token>`. Unset means writes are open |
 | `SANDBOX` | `0` | With `API_TOKEN`, let visitors add capped, expiring monitors. See "Sandbox mode" |
-| `SANDBOX_MAX_PER_DAY` | `3` | Visitor additions allowed in any rolling 24 hours, across all visitors |
+| `SANDBOX_MAX_PER_DAY` | `3` | Visitor additions allowed per UTC day, across all visitors. Resets at midnight UTC |
 | `SANDBOX_TTL_HOURS` | `24` | How long a visitor's monitor lives before the scheduler removes it |
 
 Everything has a working default, so a fresh clone runs with no configuration
@@ -496,7 +497,7 @@ pytest -v
 ruff check .
 ```
 
-197 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
+198 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
 scheduler tests pass `now` in explicitly rather than waiting, so a lease can be
 aged past its 90 second timeout without the suite taking 90 seconds.
 

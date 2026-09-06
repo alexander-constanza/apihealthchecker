@@ -4,9 +4,11 @@ With API_TOKEN set, the deployed demo is read-only for visitors, which keeps
 it intact and also makes the add-monitor form a decoration. Sandbox mode is
 the middle ground. When SANDBOX=1:
 
-- Anyone can add a monitor, up to SANDBOX_MAX_PER_DAY (3) in any rolling 24
-  hours across all visitors. The cap is global, not per visitor, because
-  there is no honest way to tell visitors apart without accounts.
+- Anyone can add a monitor, up to SANDBOX_MAX_PER_DAY (3) per UTC day across
+  all visitors, resetting at midnight UTC. The cap is global, not per
+  visitor, because there is no honest way to tell visitors apart without
+  accounts. Midnight rather than a rolling window so "try again tomorrow"
+  means what it says and the page can print the reset time.
 - A visitor's monitor is removed automatically SANDBOX_TTL_HOURS (24) after
   it was added, history and all.
 - Visitors can delete only monitors that visitors added. The seeded eight and
@@ -45,7 +47,6 @@ logger = logging.getLogger("apihealthchecker")
 DEFAULT_MAX_PER_DAY = 3
 DEFAULT_TTL_HOURS = 24
 MIN_VISITOR_INTERVAL_SECONDS = 60
-WINDOW = timedelta(hours=24)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -138,16 +139,27 @@ def visitor_rejection(cleaned: dict) -> tuple[dict, int] | None:
     return None
 
 
-def additions_in_window(session, now=None) -> int:
-    """Visitor monitors created in the last 24 hours, whether or not they still exist."""
+def start_of_day(now=None):
+    """Midnight UTC of the current day. Everything stored is UTC, so this is too."""
     now = now or utcnow()
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def next_reset(now=None):
+    return start_of_day(now) + timedelta(days=1)
+
+
+def additions_today(session, now=None) -> int:
+    """Visitor monitors created since midnight UTC, whether or not they still exist."""
     return session.execute(
-        select(func.count()).select_from(SandboxEntry).where(SandboxEntry.created_at > now - WINDOW)
+        select(func.count())
+        .select_from(SandboxEntry)
+        .where(SandboxEntry.created_at >= start_of_day(now))
     ).scalar_one()
 
 
 def additions_remaining(session, now=None) -> int:
-    return max(max_per_day() - additions_in_window(session, now=now), 0)
+    return max(max_per_day() - additions_today(session, now=now), 0)
 
 
 def register_sandbox_monitor(session, monitor: Monitor, now=None) -> SandboxEntry:
@@ -218,6 +230,7 @@ def sandbox_view(session, now=None) -> dict:
         "enabled": True,
         "max_per_day": max_per_day(),
         "additions_remaining": additions_remaining(session, now=now),
+        "resets_at": next_reset(now).isoformat(),
         "ttl_hours": ttl_hours(),
         "min_interval_seconds": MIN_VISITOR_INTERVAL_SECONDS,
     }

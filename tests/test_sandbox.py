@@ -1,6 +1,6 @@
 """Sandbox tests: visitors can add within the cap, cannot touch what they did
 not add, and what they add goes away on time. The operator is exempt."""
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import responses
@@ -90,17 +90,25 @@ def test_cap_is_three_per_day_and_counts_deletions(client, sandbox):
     assert resp.status_code == 201
 
 
-def test_cap_window_rolls(session, sandbox):
-    old = utcnow() - timedelta(hours=25)
-    recent = utcnow() - timedelta(hours=1)
+def test_cap_resets_at_midnight_utc(session, sandbox):
+    now = datetime(2026, 9, 6, 10, 0, tzinfo=UTC)
+    yesterday = datetime(2026, 9, 5, 23, 59, tzinfo=UTC)
+    today = datetime(2026, 9, 6, 0, 1, tzinfo=UTC)
     session.add_all(
         [
-            SandboxEntry(monitor_id=None, created_at=old, expires_at=old),
-            SandboxEntry(monitor_id=None, created_at=recent, expires_at=recent),
+            SandboxEntry(monitor_id=None, created_at=yesterday, expires_at=yesterday),
+            SandboxEntry(monitor_id=None, created_at=today, expires_at=today),
         ]
     )
     session.commit()
-    assert additions_remaining(session) == 2
+    assert additions_remaining(session, now=now) == 2
+    assert additions_remaining(session, now=datetime(2026, 9, 7, 0, 0, tzinfo=UTC)) == 3
+
+
+def test_status_says_when_the_cap_resets(client, sandbox):
+    sb = client.get("/api/status").get_json()["sandbox"]
+    assert sb["resets_at"].endswith("T00:00:00+00:00")
+    assert sb["resets_at"] > utcnow().isoformat()
 
 
 def test_status_reports_the_sandbox_rules(client, sandbox):
