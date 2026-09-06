@@ -28,6 +28,79 @@ an actual service, so a failing check becomes "critical / connectivity, 3
 minutes ago" on a page you can leave open, rather than an exit code you have to
 be watching for.
 
+## Using it, in plain terms
+
+Think of it as a smoke alarm for websites. You give it a few web addresses you
+care about. Once a minute it quietly visits each one, notes whether it answered
+and how fast, and shows the results on a single page. When something stops
+answering, its box turns red and a message goes out.
+
+### What you are looking at
+
+Open the live demo in any browser. Each box is a "monitor", which just means
+one web address being watched. The demo watches eight real ones: GitHub, PyPI,
+the npm registry and so on. Six are healthy. Two are deliberately broken so you
+can see what failure looks like: one points at a package that does not exist,
+the other at a made-up domain.
+
+In each box:
+
+- **The colour** is the headline. Green means the last visit passed. Red means
+  it failed. Grey means the service could not tell, which is different from
+  broken and usually means a typo in the address.
+- **The milliseconds figure** is how long the site took to answer. A few
+  hundred is normal.
+- **"Checked 2 minutes ago"** is when it last looked. The page refreshes
+  itself every 15 seconds, so you can leave it open.
+- **The row of small bars** is recent history. Each bar is one visit, taller
+  means slower, red means it failed.
+- **Two extra words on red boxes**, such as "critical / connectivity" or
+  "medium / not found". The service reads the error and files it by kind and
+  seriousness. A site that does not exist at all is critical. A missing page
+  is medium, because that is usually an old link, not an outage.
+
+The summary line at the top counts how many are ok, failing or unknown, and
+names the worst problem on the page.
+
+### Two ways to use it
+
+**As a visitor, no password needed.** The grey note above the list explains
+the rules. Anyone can add a monitor by clicking "Add monitor", typing a name,
+pasting a full address starting with `https://`, and pressing Add. Up to three
+people a day can do this. Whatever gets added disappears again after 24 hours,
+and the eight demo monitors cannot be deleted by visitors. The "Check" button
+on any box looks right now instead of waiting, once every 30 seconds per box.
+That is enough to play with it without being able to break it.
+
+**As the operator.** The operator holds a token, which is a long password set
+when the service was deployed. The first time a browser does something a
+visitor is not allowed to do, such as deleting one of the eight or adding a
+fourth monitor in a day, the page asks for the token once and remembers it in
+that browser. With the token none of the visitor limits apply: monitors stay
+for good, anything can be deleted, and addresses on a private network can be
+watched.
+
+**The alert.** When a monitor changes state, say green to red, one message is
+sent to the webhook address the operator configured. It carries the monitor's
+name, what went wrong and how serious it is. It sends once per change, not
+once per minute, so a site that stays down does not flood anyone. Monitors
+added by visitors never trigger it. On the demo the receiver is a page you look
+at. In a real setup that address would belong to something that sends a text
+or a Slack message.
+
+### What to use it for, and what not to
+
+Use it when a handful of websites or services matter to you or to people you
+look after: a small business's booking page, a payment provider you depend on,
+an internal tool, a client's site. It answers three questions without anyone
+checking by hand: is it up, how fast is it, and when did it last break. When
+someone asks "was the site down last night?", the history strip is the answer.
+
+It does not ring a phone, fix anything, or watch anything it has not been told
+about. It is a truthful record and a page you can point at. That is most of
+what a support or operations person needs on their first day. The rest of this
+README is for the person who wants to know how it is built.
+
 ## How the three repos compose
 
 ```
