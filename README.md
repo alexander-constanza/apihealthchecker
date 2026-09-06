@@ -252,13 +252,28 @@ if it does not.
 ```json
 {
   "event": "monitor_failed",
-  "previous_status": "ok",
+  "previous_status": null,
   "status": "fail",
-  "monitor": {"id": 7, "name": "PyPI JSON API", "target": "https://pypi.org/...", "type": "http", ...},
-  "result": {"id": 2811, "status": "fail", "category": "server_error", "severity": "critical", "message": "Responded 503", ...},
-  "sent_at": "2026-09-06T04:20:11+00:00"
+  "monitor": {
+    "id": 9, "name": "Alert demo (temporary)", "target": "https://httpbin.org/status/503",
+    "type": "http", "interval_seconds": 300, "enabled": true,
+    "created_at": "2026-09-06T04:53:00.903747+00:00"
+  },
+  "result": {
+    "id": 3000, "monitor_id": 9, "status": "fail", "message": "Responded 503",
+    "category": "server_error", "severity": "critical", "latency_ms": 431.56,
+    "detail": {"status_code": 503, "elapsed_ms": 431.56, "classifier_used": "rules", "classifier_confidence": 1.0},
+    "checked_at": "2026-09-06T04:53:01.744324+00:00"
+  },
+  "sent_at": "2026-09-06T04:53:02+00:00"
 }
 ```
+
+That payload is from the live service: a monitor added through the API against
+a URL that returns 503, checked with the check-now endpoint, and delivered to a
+request-capture webhook with `alert_sent` in the logs. `previous_status` is
+null because it was the monitor's first result, which is the one case where a
+first result alerts.
 
 The POST happens after the result is committed, never inside the transaction,
 so a slow or dead webhook costs an alert and never a row. There are no retries

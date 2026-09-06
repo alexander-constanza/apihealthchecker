@@ -166,12 +166,24 @@ Setting a secret restarts the machine. Confirm it took, without exposing it:
 curl https://<app-name>.fly.dev/health      # "alerting": {"webhook_configured": true}
 ```
 
-To see one fire, use the check-now button on a monitor whose status is about to
-change, or add a monitor pointing at a URL that returns 500, then:
+To see one fire without waiting for something real to break, add a monitor
+that fails, check it now, then remove it. A monitor's first result alerts if it
+is not ok, so this produces exactly one `monitor_failed`:
 
 ```bash
+BASE=https://<app-name>.fly.dev
+ID=$(curl -s -X POST $BASE/api/monitors -H 'Content-Type: application/json' \
+  -d '{"name": "Alert demo", "target": "https://httpbin.org/status/503", "interval_seconds": 300}' \
+  | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+curl -s -X POST $BASE/api/monitors/$ID/check
 fly logs --no-tail | grep -E "monitor_status_changed|alert_"
+curl -s -X DELETE $BASE/api/monitors/$ID
 ```
+
+`alert_sent` with `status_code: 200` means the receiver took it. `alert_failed`
+carries the exception class and the status code, and deliberately not the URL,
+since a webhook URL is usually a token. A 404 there almost always means the
+secret was pasted wrong.
 
 Retention needs nothing set. `RETENTION_DAYS` defaults to 30 and can be changed
 in the `[env]` block of `fly.toml`.
