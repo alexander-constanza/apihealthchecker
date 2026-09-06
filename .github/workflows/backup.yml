@@ -1,0 +1,48 @@
+name: backup
+
+# A daily copy of the production database, taken with SQLite's online backup
+# API so it is consistent while the service keeps writing, pulled off the Fly
+# volume and stored as a workflow artifact for 30 days. This is the offsite
+# copy DEPLOY.md describes; Fly's own snapshots stay on Fly.
+#
+# Uses the same FLY_API_TOKEN secret as the deploy workflow.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      APP: apihealthchecker
+    steps:
+      # Pinned to a commit, not a branch. Tag 1.6.
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+
+      - name: Take a consistent copy on the machine
+        run: |
+          flyctl ssh console -a "$APP" -C "python -c \"import sqlite3; s = sqlite3.connect('/data/apihealthchecker.db'); d = sqlite3.connect('/tmp/backup.db'); s.backup(d); d.close(); print('backup written')\""
+
+      - name: Pull it off the volume
+        run: |
+          flyctl ssh sftp get /tmp/backup.db ./apihealthchecker.db -a "$APP"
+          ls -la ./apihealthchecker.db
+
+      - name: Check it opens and has the tables
+        run: |
+          sqlite3 ./apihealthchecker.db "pragma integrity_check;"
+          sqlite3 ./apihealthchecker.db "select 'monitors', count(*) from monitors union all select 'check_results', count(*) from check_results union all select 'daily_rollups', count(*) from daily_rollups;"
+
+      - name: Store for 30 days
+        uses: actions/upload-artifact@v7
+        with:
+          name: apihealthchecker-db-${{ github.run_id }}
+          path: ./apihealthchecker.db
+          retention-days: 30
+          if-no-files-found: error

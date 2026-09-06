@@ -1,0 +1,82 @@
+name: alerts
+
+# The deployed service sends each monitor status change to this repository's
+# repository_dispatch endpoint (ALERT_WEBHOOK_FORMAT=github). This workflow
+# turns those into issues: a failure opens one, a recovery comments and closes
+# it. GitHub then emails whoever watches the repository, which makes the
+# repository the pager without running anything else.
+#
+# Issues are matched by the label below and the "[monitor #id]" suffix in the
+# title, so one monitor has at most one open issue however often it flaps.
+
+on:
+  repository_dispatch:
+    types: [monitor_alert]
+
+permissions:
+  issues: write
+
+jobs:
+  issue:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const p = context.payload.client_payload || {};
+            const monitor = p.monitor || {};
+            const result = p.result || {};
+            const label = "monitor-alert";
+            const marker = `[monitor #${monitor.id}]`;
+            const failing = p.event === "monitor_failed" || p.event === "monitor_unknown";
+
+            const { owner, repo } = context.repo;
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: "open", labels: label, per_page: 100,
+            });
+            const existing = open.find((i) => i.title.endsWith(marker));
+
+            const detail = [
+              `**Monitor:** ${monitor.name} (${monitor.target})`,
+              `**Event:** ${p.event}`,
+              `**Status:** ${p.previous_status ?? "none"} to ${p.status}`,
+              result.severity ? `**Severity:** ${result.severity} / ${result.category}` : null,
+              result.message ? `**Message:** ${result.message}` : null,
+              result.latency_ms != null ? `**Latency:** ${result.latency_ms} ms` : null,
+              `**Checked at:** ${result.checked_at}`,
+              `**Sent at:** ${p.sent_at}`,
+              "",
+              "Payload as received:",
+              "```json",
+              JSON.stringify(p, null, 2),
+              "```",
+            ].filter((line) => line !== null).join("\n");
+
+            if (failing) {
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `Still failing. New result:\n\n${detail}`,
+                });
+                core.info(`commented on #${existing.number}`);
+              } else {
+                const created = await github.rest.issues.create({
+                  owner, repo,
+                  title: `Monitor failing: ${monitor.name} ${marker}`,
+                  labels: [label],
+                  body: detail,
+                });
+                core.info(`opened #${created.data.number}`);
+              }
+            } else if (existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number,
+                body: `Recovered.\n\n${detail}`,
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: existing.number, state: "closed",
+              });
+              core.info(`closed #${existing.number}`);
+            } else {
+              core.info("recovery with no open issue; nothing to do");
+            }
