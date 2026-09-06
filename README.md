@@ -249,31 +249,14 @@ transition is POSTed there as JSON: `ok` to `fail` sends `monitor_failed`,
 check. A monitor's very first result sends nothing if it passes and an alert
 if it does not.
 
-```json
-{
-  "event": "monitor_failed",
-  "previous_status": null,
-  "status": "fail",
-  "monitor": {
-    "id": 9, "name": "Alert demo (temporary)", "target": "https://httpbin.org/status/503",
-    "type": "http", "interval_seconds": 300, "enabled": true,
-    "created_at": "2026-09-06T04:53:00.903747+00:00"
-  },
-  "result": {
-    "id": 3000, "monitor_id": 9, "status": "fail", "message": "Responded 503",
-    "category": "server_error", "severity": "critical", "latency_ms": 431.56,
-    "detail": {"status_code": 503, "elapsed_ms": 431.56, "classifier_used": "rules", "classifier_confidence": 1.0},
-    "checked_at": "2026-09-06T04:53:01.744324+00:00"
-  },
-  "sent_at": "2026-09-06T04:53:02+00:00"
-}
-```
+![Webhook payload as received by webhook.site](docs/alert-webhook.png)
 
-That payload is from the live service: a monitor added through the API against
-a URL that returns 503, checked with the check-now endpoint, and delivered to a
-request-capture webhook with `alert_sent` in the logs. `previous_status` is
-null because it was the monitor's first result, which is the one case where a
-first result alerts.
+That is the request as the receiver got it from the live service: a monitor
+added through the API against a URL that returns 503, checked with the
+check-now endpoint, delivered with `alert_sent` in the logs. `previous_status`
+is null because it was the monitor's first result, which is the one case where
+a first result alerts. The receiver's own header block is cropped out because
+it shows the webhook URL, and a webhook URL is a token.
 
 The POST happens after the result is committed, never inside the transaction,
 so a slow or dead webhook costs an alert and never a row. There are no retries
