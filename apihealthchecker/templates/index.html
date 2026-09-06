@@ -533,6 +533,34 @@ function readError(response) {
   });
 }
 
+// Writes need a bearer token when the service has API_TOKEN set. The token is
+// asked for once, on the first 401, and kept in localStorage for this browser.
+// Reads never send it, so the page works for anyone and the token only ever
+// travels on requests that change something.
+var TOKEN_KEY = "apihealthchecker.apiToken";
+
+function storedToken() {
+  try { return window.localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+}
+
+function rememberToken(token) {
+  try { window.localStorage.setItem(TOKEN_KEY, token); } catch (e) { /* private mode */ }
+}
+
+function apiFetch(url, options, retried) {
+  options = options || {};
+  var headers = Object.assign({}, options.headers || {});
+  var token = storedToken();
+  if (token) headers["Authorization"] = "Bearer " + token;
+  return fetch(url, Object.assign({}, options, { headers: headers })).then(function (r) {
+    if (r.status !== 401 || retried) return r;
+    var entered = window.prompt("This service requires an API token to make changes. Paste it here:");
+    if (!entered) return r;
+    rememberToken(entered.trim());
+    return apiFetch(url, options, true);
+  });
+}
+
 function refresh() {
   return Promise.all([
     fetch("/api/status").then(function (r) { return r.json(); }),
@@ -560,7 +588,7 @@ function refresh() {
 function checkNow(id, button) {
   button.disabled = true;
   button.textContent = "...";
-  fetch("/api/monitors/" + id + "/check", { method: "POST" }).then(function (r) {
+  apiFetch("/api/monitors/" + id + "/check", { method: "POST" }).then(function (r) {
     if (!r.ok) return readError(r).then(function (m) { throw new Error(m); });
     return r.json();
   }).then(function () {
@@ -576,7 +604,7 @@ function checkNow(id, button) {
 
 function removeMonitor(id, name) {
   if (!window.confirm("Delete monitor \"" + name + "\" and its history?")) return;
-  fetch("/api/monitors/" + id, { method: "DELETE" }).then(function (r) {
+  apiFetch("/api/monitors/" + id, { method: "DELETE" }).then(function (r) {
     if (!r.ok) return readError(r).then(function (m) { throw new Error(m); });
     notify("", null);
     return refresh();
@@ -612,7 +640,7 @@ addForm.addEventListener("submit", function (event) {
     type: "http",
     interval_seconds: parseInt(form.interval_seconds.value, 10)
   };
-  fetch("/api/monitors", {
+  apiFetch("/api/monitors", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)

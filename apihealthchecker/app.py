@@ -14,6 +14,11 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import HTTPException
 
+from apihealthchecker.auth import (
+    request_is_authorized,
+    request_needs_token,
+    write_token_required,
+)
 from apihealthchecker.classifier import worst_severity
 from apihealthchecker.db import (
     CheckResultRow,
@@ -97,6 +102,25 @@ def _register_lifecycle(app: Flask) -> None:
                 "path": request.path,
             },
         )
+
+    @app.before_request
+    def require_token_for_writes():
+        """Refuse writes without the token, before any route runs. See auth.py."""
+        if not request_needs_token() or request_is_authorized():
+            return None
+        logger.warning(
+            "request_unauthorized",
+            extra={"request_id": g.request_id, "method": request.method, "path": request.path},
+        )
+        response = jsonify(
+            {
+                "error": "unauthorized",
+                "message": "This endpoint requires Authorization: Bearer <API_TOKEN>",
+            }
+        )
+        response.status_code = 401
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
 
     @app.after_request
     def log_response(response):
@@ -219,6 +243,7 @@ def _register_api(app: Flask) -> None:
                     "owner": scheduler.owner if scheduler else None,
                 },
                 "alerting": {"webhook_configured": webhook_url() is not None},
+                "auth": {"write_token_required": write_token_required()},
             }
         ), (200 if db_ok else 503)
 
