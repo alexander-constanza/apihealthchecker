@@ -216,6 +216,28 @@ visitor tries to change something and keeps it in that browser's localStorage.
 To rotate, set a new value with the same command. To open writes again,
 `fly secrets unset API_TOKEN`.
 
+### Sandbox mode
+
+With the token set, visitors can only look. To let them try adding a monitor
+without being able to damage the demo, turn on sandbox mode. It is not a
+secret, so it lives in `fly.toml`:
+
+```toml
+[env]
+  SANDBOX = "1"
+```
+
+The committed `fly.toml` has it on. It needs `API_TOKEN` to mean anything;
+without one the app logs `sandbox_needs_token` and behaves as if it were off.
+Rules and limits are in the README under "Sandbox mode". Confirm with:
+
+```bash
+curl -s https://<app-name>.fly.dev/api/status      # "sandbox": {"enabled": true, "additions_remaining": 3, ...}
+```
+
+Expired visitor monitors are removed by the scheduler within seconds of their
+time, and logged as `sandbox_monitors_expired`.
+
 ### Verifying the volume actually persisted
 
 The point of the volume is that this survives a deploy:

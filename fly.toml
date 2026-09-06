@@ -17,6 +17,9 @@ primary_region = "lhr"
   # fine, and the entire check history disappears on the next deploy.
   DB_PATH = "/data/apihealthchecker.db"
   SEED_ON_START = "1"
+  # Visitors may add a few expiring monitors but cannot touch the seeded
+  # ones. Needs the API_TOKEN secret to be set. See sandbox.py.
+  SANDBOX = "1"
 
 [[mounts]]
   source = "apihealthchecker_data"

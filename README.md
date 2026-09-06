@@ -8,8 +8,9 @@ records every result over time, classifies failures by category and severity,
 and serves a live status page.
 
 **Live demo:** https://apihealthchecker.fly.dev/ ([deployment steps](DEPLOY.md)).
-Everything is readable. Adding, deleting or re-checking a monitor needs the
-API token, so the demo stays the way it is shown here.
+It runs in sandbox mode: anyone can add a monitor, up to three a day, and it
+is removed again after 24 hours. The eight seeded monitors cannot be deleted
+by visitors, so the demo stays the way it is shown here.
 
 ![Status page screenshot](docs/screenshot.png)
 
@@ -285,6 +286,38 @@ over the last year" stops being answerable once the window is shorter than a
 year. A rollup table is the obvious next step and was left out on purpose, as a
 second write path a demo does not need.
 
+## Sandbox mode
+
+With `API_TOKEN` set the demo is safe and the add-monitor form is a
+decoration. Sandbox mode is the middle ground, and it is what the live demo
+runs. Set `SANDBOX=1` alongside `API_TOKEN` and:
+
+- Anyone can add a monitor, up to `SANDBOX_MAX_PER_DAY` (3) in any rolling 24
+  hours across all visitors. The page shows how many are left.
+- A visitor's monitor is removed `SANDBOX_TTL_HOURS` (24) after it was added,
+  history and all. The card carries a "sandbox, 23h left" tag.
+- Visitors can delete only what visitors added. The seeded eight and anything
+  the operator added answer `403`.
+- Visitors can press check-now on anything.
+- A visitor's target must be a public hostname and check at most once a
+  minute. A monitor is an outbound request on a schedule, and an open form
+  should not let the service be pointed at its own network, or at someone
+  else's six times a minute.
+
+The operator, meaning any request carrying the token, is exempt from all of
+it. Visitor monitors live in a separate `sandbox_entries` table rather than a
+column on `monitors`, because `create_all` will create a missing table on the
+deployed database but will not add a column to an existing one. The rows
+outlive their monitors on purpose: the daily cap counts creations, so add,
+delete, add again does not go around it.
+
+Honest limits. The cap is global because there is no honest way to tell
+visitors apart without accounts, so three strangers can use up the day
+between them. The hostname check is by name and IP literal only; a public name
+that resolves to a private address is not caught. There is no rate limiting
+on reads and no CAPTCHA. It stops the demo filling up and stops the obvious
+misuse, which is the whole ambition.
+
 ## API
 
 | Method | Path | Purpose |
@@ -300,9 +333,9 @@ second write path a demo does not need.
 
 Reads are open. When `API_TOKEN` is set, the three write endpoints (`POST` and
 `DELETE`) need `Authorization: Bearer <token>` and answer `401` without it.
-The deployed demo has it set: the status page and every `GET` work for anyone,
-and the write endpoints refuse without the token. Verified from outside with
-`curl`, and `/health` says so.
+The deployed demo has it set and runs in sandbox mode on top, so visitors can
+use the three write endpoints within the sandbox rules above, and `403`, `429`
+and `400` say which rule they hit. `/health` reports both flags.
 The check is a `before_request` hook keyed on method and path rather than a
 decorator per route, so a write endpoint added later is protected before
 anyone remembers to protect it. One shared token, deliberately: accounts and
@@ -319,7 +352,8 @@ curl localhost:8080/health
   "dependencies": {"database": "ok"},
   "scheduler": {"running_in_this_process": true, "owner": "287e610c732d58:654:158f1c"},
   "alerting": {"webhook_configured": true},
-  "auth": {"write_token_required": true}
+  "auth": {"write_token_required": true},
+  "sandbox": {"enabled": true}
 }
 ```
 
@@ -385,8 +419,9 @@ which for a monitoring tool is not a hypothetical situation.
 - Failure category and severity shown on failing monitors
 - A bar strip of the last 30 results per monitor, height scaled to latency
 - A form to add a monitor, and a check-now button per monitor. When the
-  service has `API_TOKEN` set, the first change asks for the token once and
-  remembers it in the browser
+  service has `API_TOKEN` set, the first refused change asks for the token
+  once and remembers it in the browser. In sandbox mode a note above the list
+  states the rules and how many additions are left
 - Auto-refresh via `fetch` every 15 seconds
 - Dark mode via `prefers-color-scheme`
 
@@ -430,6 +465,9 @@ gunicorn --bind 127.0.0.1:8080 --workers 1 --threads 8 \
 | `RETENTION_DAYS` | `30` | Delete check results older than this, checked hourly by the scheduler. `0` keeps everything |
 | `ALERT_WEBHOOK_URL` | unset | POST a JSON payload here on every monitor status change. Unset means no alerting |
 | `API_TOKEN` | unset | When set, `POST` and `DELETE` under `/api` need `Authorization: Bearer <token>`. Unset means writes are open |
+| `SANDBOX` | `0` | With `API_TOKEN`, let visitors add capped, expiring monitors. See "Sandbox mode" |
+| `SANDBOX_MAX_PER_DAY` | `3` | Visitor additions allowed in any rolling 24 hours, across all visitors |
+| `SANDBOX_TTL_HOURS` | `24` | How long a visitor's monitor lives before the scheduler removes it |
 
 Everything has a working default, so a fresh clone runs with no configuration
 and the same code deploys unchanged.
@@ -458,7 +496,7 @@ pytest -v
 ruff check .
 ```
 
-169 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
+197 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
 scheduler tests pass `now` in explicitly rather than waiting, so a lease can be
 aged past its 90 second timeout without the suite taking 90 seconds.
 
@@ -489,6 +527,8 @@ Honest about what this is not:
 - **A lease, not a distributed lock.** See the scheduler section. There is a
   narrow window in which two schedulers could overlap and write a duplicate row.
   Acceptable for monitoring history, not for anything transactional.
+- **The sandbox is a courtesy limit, not abuse protection.** See "Sandbox
+  mode" for what it does not catch.
 - **One shared token, not accounts.** `API_TOKEN` stops strangers from
   deleting monitors on a public instance. It does not say who did what, has no
   roles, no rotation without a restart, and no rate limiting. The status page
