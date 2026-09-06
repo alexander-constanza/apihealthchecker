@@ -299,11 +299,18 @@ runs. Set `SANDBOX=1` alongside `API_TOKEN` and:
   history and all. The card carries a "sandbox, 23h left" tag.
 - Visitors can delete only what visitors added. The seeded eight and anything
   the operator added answer `403`.
-- Visitors can press check-now on anything.
-- A visitor's target must be a public hostname and check at most once a
-  minute. A monitor is an outbound request on a schedule, and an open form
-  should not let the service be pointed at its own network, or at someone
-  else's six times a minute.
+- Visitors can press check-now on anything, once per monitor every 30
+  seconds. Check-now is an outbound request on demand, and without a limit a
+  loop of POSTs turns the demo into a request source aimed at whatever the
+  seeded monitors target, from the demo's own IP.
+- A visitor's target must be a public address and check at most once a
+  minute. IP literals are checked in every spelling the resolver accepts
+  (`127.1`, `0x7f000001` and `2130706433` are all loopback), names are
+  resolved and refused if any address they resolve to is private, and only
+  `http` monitors can be added.
+- Transitions on visitor monitors are logged but never sent to the webhook.
+  Otherwise a visitor could point one at a target that flaps and page the
+  operator once a minute.
 
 The operator, meaning any request carrying the token, is exempt from all of
 it. Visitor monitors live in a separate `sandbox_entries` table rather than a
@@ -314,10 +321,14 @@ delete, add again does not go around it.
 
 Honest limits. The cap is global because there is no honest way to tell
 visitors apart without accounts, so three strangers can use up the day
-between them. The hostname check is by name and IP literal only; a public name
-that resolves to a private address is not caught. There is no rate limiting
-on reads and no CAPTCHA. It stops the demo filling up and stops the obvious
-misuse, which is the whole ambition.
+between them. The cap check and the insert are made atomic with a process
+lock, which is correct for the one-process deployment and would need to move
+into the database before a second process. Two holes stay open on purpose,
+because closing them means changing the vendored check engine: DNS rebinding,
+where a name resolves publicly when added and privately when checked, and a
+public target that redirects to a private address, since the engine follows
+redirects. In both cases the response body is never stored, so what can leak
+is a status code. There is no rate limiting on reads and no CAPTCHA.
 
 ## API
 
@@ -425,6 +436,9 @@ which for a monitoring tool is not a hypothetical situation.
   states the rules and how many additions are left
 - Auto-refresh via `fetch` every 15 seconds
 - Dark mode via `prefers-color-scheme`
+- A Content Security Policy with a per-request nonce, so the inline CSS and
+  JavaScript the page is made of are the only inline CSS and JavaScript it
+  will run, plus `nosniff`, `DENY` framing and `no-referrer`
 
 ## Running it
 
@@ -469,6 +483,7 @@ gunicorn --bind 127.0.0.1:8080 --workers 1 --threads 8 \
 | `SANDBOX` | `0` | With `API_TOKEN`, let visitors add capped, expiring monitors. See "Sandbox mode" |
 | `SANDBOX_MAX_PER_DAY` | `3` | Visitor additions allowed per UTC day, across all visitors. Resets at midnight UTC |
 | `SANDBOX_TTL_HOURS` | `24` | How long a visitor's monitor lives before the scheduler removes it |
+| `SANDBOX_CHECK_COOLDOWN_SECONDS` | `30` | Minimum gap between visitor check-now presses on one monitor |
 
 Everything has a working default, so a fresh clone runs with no configuration
 and the same code deploys unchanged.
@@ -497,9 +512,15 @@ pytest -v
 ruff check .
 ```
 
-198 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
+233 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
 scheduler tests pass `now` in explicitly rather than waiting, so a lease can be
 aged past its 90 second timeout without the suite taking 90 seconds.
+
+A hardening pass added `tests/test_hardening.py`, one test per thing an
+adversarial run found: loopback spelled as `127.1`, ids past 64 bits turning
+into 500s, a kilobyte of `[` reaching the JSON parser's recursion limit, a
+header value with a newline, twelve visitors hitting the cap at once, and
+control characters in a name. Each stays as a test so it stays fixed.
 
 Coverage is deliberately weighted toward the things that bite in production: the
 404-stays-404 and 405-stays-405 cases, every validation rejection path, the
