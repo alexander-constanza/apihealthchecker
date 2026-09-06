@@ -17,8 +17,10 @@ by visitors, so the demo stays the way it is shown here.
 The status page above is a real run against live endpoints: six healthy public
 APIs, one genuine 404 (a PyPI package that does not exist), and one DNS failure
 (a host that does not resolve). The two failures are classified automatically,
-`medium / not_found` and `critical / connectivity`, and each monitor keeps a
-rolling history strip where bar height encodes latency. A dark variant is at
+`medium / not_found` and `critical / connectivity`. Each monitor keeps a
+rolling history strip where bar height encodes latency, and an uptime figure
+over the days it has data for. The note above the list is sandbox mode
+explaining its rules to a visitor. A dark variant is at
 [docs/screenshot-dark.png](docs/screenshot-dark.png).
 
 The pitch: three earlier repos each do one thing well and stop at the edge of
