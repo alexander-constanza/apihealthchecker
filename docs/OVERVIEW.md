@@ -4,96 +4,89 @@ A monitoring service that checks endpoints on a schedule, classifies failures,
 keeps history, alerts on change, and runs on Fly.io with CI/CD from GitHub.
 Live: https://apihealthchecker.fly.dev/
 
-## Flow chart
+## Flow chart, in four pieces
+
+Colour says which segment a part belongs to: blue is the request path, green
+is checking, amber is data, purple is shipping and operations.
+
+### 1. What happens to a request
 
 ```mermaid
-flowchart TD
-    subgraph upstream["Upstream repos, reused not rewritten"]
-        IHC["infra-health-check<br/><i>check engine, vendored verbatim</i>"]
-        ADT["api-debugging-toolkit<br/><i>app factory, JSON logs, request ids, error split</i>"]
-        TTA["ticket-triage-assistant<br/><i>scored keyword classifier</i>"]
+flowchart LR
+    C["Client<br/>visitor, operator or script"] --> G["Gate<br/>request id, nonce"]
+    G -->|who?| T["Token check<br/>is this the operator?"]
+    T -->|visitor| S["Sandbox rules<br/>what may a visitor do?"]
+    S -->|allowed| R["Route<br/>page, /health, /api"]
+    R --> H["Headers + log<br/>CSP, nosniff, one JSON line"]
+    classDef req fill:#DCE6F1,stroke:#2E5C8A,color:#1B2026
+    class C,G,T,S,R,H req
+```
+
+### 2. One check, start to finish
+
+```mermaid
+flowchart LR
+    B["Check button<br/>on the page"] --> RU
+    SC["Scheduler<br/>lease, tick every 5s"] --> RU["Runner<br/>rows become checks"]
+    RU --> E["Engine<br/>HTTP request, timeout"]
+    E --> CL["Classifier<br/>category + severity"]
+    CL --> DB[("Database<br/>result row saved")]
+    DB -->|after commit| N["Notifier<br/>only when status changes"]
+    N -->|webhook| GH["GitHub<br/>issue opens, you get email"]
+    classDef req fill:#DCE6F1,stroke:#2E5C8A,color:#1B2026
+    classDef check fill:#D8EEE9,stroke:#1F7A6D,color:#1B2026
+    classDef data fill:#F3E7CF,stroke:#9A6A1B,color:#1B2026
+    classDef ops fill:#E6DDF0,stroke:#6B4C8A,color:#1B2026
+    class B req
+    class SC,RU,E,CL,N check
+    class DB data
+    class GH ops
+```
+
+### 3. What is stored, and what keeps it tidy
+
+```mermaid
+flowchart TB
+    subgraph jobs["Scheduler maintenance"]
+        RO["Roll up<br/>hourly, before pruning"]
+        PR["Prune<br/>hourly, older than 30 days"]
+        EX["Expire<br/>every tick, visitor monitors"]
     end
-
-    subgraph clients["Clients"]
-        VIS["Visitor browser<br/><i>reads everything, sandbox writes</i>"]
-        OPR["Operator<br/><i>bearer API_TOKEN, no limits</i>"]
-        CURL["curl / scripts<br/><i>REST API</i>"]
+    subgraph tables["SQLite on the Fly volume"]
+        M[("monitors<br/>what to check")]
+        CR[("check_results<br/>every result, 30 days")]
+        DR[("daily_rollups<br/>uptime, kept for good")]
+        SL[("scheduler_lock<br/>who runs the checks")]
+        SE[("sandbox_entries<br/>visitor monitor expiry")]
+        SS[("sandbox_slots<br/>the daily cap")]
     end
+    RO -.->|reads| CR
+    RO -->|writes| DR
+    PR -->|deletes old| CR
+    EX -.->|reads| SE
+    EX -->|deletes expired| M
+    classDef check fill:#D8EEE9,stroke:#1F7A6D,color:#1B2026
+    classDef data fill:#F3E7CF,stroke:#9A6A1B,color:#1B2026
+    class RO,PR,EX check
+    class M,CR,DR,SL,SE,SS data
+```
 
-    subgraph web["Flask app (one gunicorn worker, 8 threads)"]
-        BR["before_request<br/><i>request id, auth hook, sandbox allowlist, CSP nonce</i>"]
-        ROUTES["Routes<br/><i>status page, /health, /api/monitors, /api/status, rollups, history</i>"]
-        AR["after_request<br/><i>CSP + security headers, structured log line</i>"]
-        SB["sandbox.py<br/><i>public host check, DNS resolve, slot cap, cooldown, expiry</i>"]
-        AUTH["auth.py<br/><i>constant time token compare</i>"]
-    end
+### 4. How it ships and stays safe
 
-    subgraph sched["Scheduler thread (one per deployment)"]
-        LEASE["Lease in scheduler_lock<br/><i>standby retry, atexit release, unique owner id</i>"]
-        TICK["tick every 5s<br/><i>due monitors, sandbox expiry</i>"]
-        MAINT["hourly maintenance<br/><i>rollup, then prune</i>"]
-    end
-
-    subgraph pipeline["One check, end to end"]
-        RUN["runner.py<br/><i>rows to engine entries, records results</i>"]
-        ENG["engine.run_checks<br/><i>threaded HTTP / S3 / EC2 checks</i>"]
-        CLS["classifier.py<br/><i>category + severity, most-severe wins</i>"]
-        NOTI["notifier.py<br/><i>transition detection, webhook POST after commit</i>"]
-    end
-
-    subgraph db["SQLite on Fly volume /data"]
-        MON[("monitors")]
-        RES[("check_results<br/><i>30 day retention</i>")]
-        ROLL[("daily_rollups<br/><i>uptime over 90 days</i>")]
-        LOCK[("scheduler_lock")]
-        SENT[("sandbox_entries<br/><i>expiry per visitor monitor</i>")]
-        SLOT[("sandbox_slots<br/><i>unique (day, slot) = the cap</i>")]
-    end
-
-    subgraph gh["GitHub"]
-        TESTS["tests.yml<br/><i>ruff + 250 tests on every push</i>"]
-        DEPLOY["deploy.yml<br/><i>tests, then flyctl deploy remote build</i>"]
-        BACKUP["backup.yml<br/><i>nightly sqlite .backup, 30 day artifact</i>"]
-        ALERTS["alerts.yml<br/><i>repository_dispatch to issue open / close</i>"]
-        ISSUE["Issue + email<br/><i>the pager</i>"]
-    end
-
-    subgraph fly["Fly.io"]
-        MACH["Machine, lhr<br/><i>auto_stop off, health check /health</i>"]
-        VOL["Volume<br/><i>daily snapshots, 5 days</i>"]
-        SEC["Secrets<br/><i>API_TOKEN, webhook URL, token, format</i>"]
-    end
-
-    IHC --> ENG
-    ADT --> BR
-    TTA --> CLS
-
-    VIS --> BR
-    OPR --> BR
-    CURL --> BR
-    BR --> AUTH --> SB --> ROUTES --> AR
-    ROUTES --> MON
-    ROUTES --> RES
-    ROUTES --> ROLL
-    ROUTES -->|check now| RUN
-
-    LEASE --> LOCK
-    LEASE --> TICK --> RUN
-    TICK --> SENT
-    TICK --> MAINT --> ROLL
-    MAINT -->|prune| RES
-
-    RUN --> ENG --> CLS --> RES
-    RUN --> NOTI
-    NOTI -->|JSON or github format| ALERTS --> ISSUE
-    SB --> SLOT
-    SB --> SENT
-
-    DEPLOY --> MACH
-    MACH --- VOL
-    SEC --> MACH
-    BACKUP -->|ssh + sftp| VOL
-    TESTS -.-> DEPLOY
+```mermaid
+flowchart LR
+    P["Push<br/>to main"] --> T["Tests<br/>ruff + 250 tests"]
+    T -->|if green| D["Deploy<br/>remote build on Fly"]
+    D --> F["Fly machine<br/>gunicorn, /health watched"]
+    S["Secrets<br/>tokens, webhook, format"] -->|env| F
+    F -->|mounts /data| V[("Volume<br/>SQLite file, daily snapshot")]
+    V -->|ssh + sftp, every night| BK["Backup<br/>nightly copy, kept 30 days"]
+    BK --> AR["Artifact<br/>the copy, on GitHub"]
+    F -->|webhook| AL["Alerts<br/>issue open, issue close"]
+    classDef ops fill:#E6DDF0,stroke:#6B4C8A,color:#1B2026
+    classDef data fill:#F3E7CF,stroke:#9A6A1B,color:#1B2026
+    class P,T,D,F,S,BK,AR,AL ops
+    class V data
 ```
 
 ## What we did, why, how
