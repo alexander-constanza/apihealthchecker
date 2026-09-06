@@ -12,6 +12,9 @@ It runs in sandbox mode: anyone can add a monitor, up to three a day, and it
 is removed again after 24 hours. The eight seeded monitors cannot be deleted
 by visitors, so the demo stays the way it is shown here.
 
+One page with a flow chart of every part and what was done and why:
+[docs/OVERVIEW.md](docs/OVERVIEW.md).
+
 ![Status page screenshot](docs/screenshot.png)
 
 The status page above is a real run against live endpoints: six healthy public
