@@ -148,6 +148,25 @@ def test_first_result_that_fails_alerts(session, monkeypatch):
     assert body["previous_status"] is None
 
 
+@responses.activate
+def test_a_failed_alert_never_logs_the_webhook_url(session, monitor, monkeypatch, caplog):
+    """A webhook URL is usually a token. The 404 traceback from requests quotes
+    the URL in full, so the failure log must not carry the traceback."""
+    monkeypatch.setenv("ALERT_WEBHOOK_URL", HOOK)
+    _seed_result(session, monitor, "ok")
+    responses.add(responses.GET, monitor.target, status=503)
+    responses.add(responses.POST, HOOK, status=404)
+
+    with caplog.at_level("WARNING", logger="apihealthchecker"):
+        run_monitors([monitor], session=session)
+
+    failures = [r for r in caplog.records if r.getMessage() == "alert_failed"]
+    assert len(failures) == 1
+    assert failures[0].error == "HTTPError"
+    assert failures[0].status_code == 404
+    assert HOOK not in caplog.text
+
+
 def test_payload_shape(session, monitor):
     row = _seed_result(session, monitor, "unknown")
     session.refresh(row)

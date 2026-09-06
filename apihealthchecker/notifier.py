@@ -95,8 +95,15 @@ def send_alert(payload: dict, url: str | None = None, timeout: float = ALERT_TIM
     try:
         response = requests.post(url, json=payload, timeout=timeout)
         response.raise_for_status()
-    except requests.RequestException:
-        logger.warning("alert_failed", extra=fields, exc_info=True)
+    except requests.RequestException as exc:
+        # No exc_info here on purpose. A requests traceback quotes the URL,
+        # and a webhook URL is usually a bearer token in disguise. The class
+        # name and status code are enough to tell a dead host from a 404.
+        status_code = exc.response.status_code if exc.response is not None else None
+        logger.warning(
+            "alert_failed",
+            extra={**fields, "error": type(exc).__name__, "status_code": status_code},
+        )
         return False
     logger.info("alert_sent", extra={**fields, "status_code": response.status_code})
     return True

@@ -439,7 +439,7 @@ pytest -v
 ruff check .
 ```
 
-155 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
+156 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
 scheduler tests pass `now` in explicitly rather than waiting, so a lease can be
 aged past its 90 second timeout without the suite taking 90 seconds.
 
