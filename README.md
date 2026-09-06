@@ -330,6 +330,38 @@ public target that redirects to a private address, since the engine follows
 redirects. In both cases the response body is never stored, so what can leak
 is a status code. There is no rate limiting on reads and no CAPTCHA.
 
+## Hardening pass
+
+Once visitors could write to the demo, the service was attacked on purpose:
+method and path tricks, every malformed bearer header, hostnames spelled to
+slip past the sandbox check, oversized and malformed bodies, header injection,
+twelve visitors hitting the cap at once, check-now in a loop, and monitor
+names built for the page. Nine things gave way. Each one is fixed and has a
+test in `tests/test_hardening.py` so it stays fixed.
+
+| Found | Now |
+|---|---|
+| `http://127.1/`, `0x7f000001` and `2130706433` are loopback to the resolver but not to `ipaddress`, so a visitor could point a monitor at the machine itself | Literals are parsed the way the resolver parses them, multicast and reserved ranges are refused, and names are resolved and refused if any address is private |
+| Twelve simultaneous visitors got six monitors through a cap of three, and three of them got 500s from lock contention | The cap check and the insert hold a process lock. Exactly three succeed, nine get a clean 429 |
+| Check-now had no limit for visitors, so a loop of POSTs made the demo a request source aimed at the seeded targets, from the demo's own IP | Thirty second cooldown per monitor for visitors, 429 with `Retry-After` |
+| A visitor's flapping monitor reached the webhook once a minute | Visitor monitors are logged, never sent |
+| Path ids past 64 bits, a kilobyte of `[`, and bodies of any size all produced 500s | 404, 400, and a 64KB limit that answers 413 before parsing |
+| An inbound `X-Request-Id` was echoed after only a length check | Replaced unless it matches a safe character set, with `fullmatch` because `$` lets a trailing newline through |
+| Null bytes and escape sequences in a name were stored and returned | 422 |
+| No security headers | A Content Security Policy with a per-request nonce for the inline style and script blocks, `nosniff`, `DENY` framing, `no-referrer`, and no `unsafe-inline` anywhere |
+| Visitors could add S3 and EC2 monitor types, refused only by accident | Refused on purpose, with a message |
+
+What held: method override headers, path case and encoding tricks, every
+bearer header variant, non-http schemes, negative ids, the `limit` parameter,
+XSS through monitor names (the page builds every node with `textContent`),
+and the token never appearing in a log line or an error body.
+
+What is left open, on purpose, because closing it means changing the vendored
+check engine: the engine follows redirects, so a public target that redirects
+to a private address is a blind request, and DNS rebinding can do the same at
+check time. The response body is never stored, so a status code is what can
+leak. See "Sandbox mode" for the cap's other honest limits.
+
 ## API
 
 | Method | Path | Purpose |
@@ -516,11 +548,8 @@ ruff check .
 scheduler tests pass `now` in explicitly rather than waiting, so a lease can be
 aged past its 90 second timeout without the suite taking 90 seconds.
 
-A hardening pass added `tests/test_hardening.py`, one test per thing an
-adversarial run found: loopback spelled as `127.1`, ids past 64 bits turning
-into 500s, a kilobyte of `[` reaching the JSON parser's recursion limit, a
-header value with a newline, twelve visitors hitting the cap at once, and
-control characters in a name. Each stays as a test so it stays fixed.
+`tests/test_hardening.py` holds one test per finding from the hardening pass
+above, including the twelve-thread race against the sandbox cap.
 
 Coverage is deliberately weighted toward the things that bite in production: the
 404-stays-404 and 405-stays-405 cases, every validation rejection path, the
