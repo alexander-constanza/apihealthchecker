@@ -353,11 +353,27 @@ receiver for looking at payloads, not a pager: nothing wakes anyone up.
 
 **Retention** is `RETENTION_DAYS`, default 30. The scheduler's owner deletes
 `check_results` rows older than that once an hour, and on its first tick after
-a start so a deploy catches up immediately. `0` keeps everything. It is
-deletion, not rollup: nothing downsampled replaces what is removed, so "uptime
-over the last year" stops being answerable once the window is shorter than a
-year. A rollup table is the obvious next step and was left out on purpose, as a
-second write path a demo does not need.
+a start so a deploy catches up immediately. `0` keeps everything.
+
+**Rollups** are what survive it. Before pruning, the same hourly maintenance
+writes one row per monitor per day into `daily_rollups`: checks, ok, fail,
+unknown, mean and maximum latency. Those rows are kept, so each card shows
+"uptime 99.6% over 12 days" from a window of 90 days even though the results
+behind the older days are gone, and `GET /api/monitors/<id>/rollups` lists
+the days. Two honest details: today's row is refreshed hourly, so the figure
+lags by up to an hour, and unknown results are reported but left out of the
+ratio, because "could not determine" is not an outage and folding it in would
+let a broken monitor drag a healthy service's number down.
+
+**The receiver on the demo is this repository.** `ALERT_WEBHOOK_FORMAT=github`
+wraps the payload for GitHub's `repository_dispatch` endpoint and
+`ALERT_WEBHOOK_AUTHORIZATION` carries the token it needs. The `alerts`
+workflow then opens an issue labelled `monitor-alert` when a monitor fails,
+comments on it while it stays down, and closes it when the monitor recovers,
+one open issue per monitor however often it flaps. GitHub emails whoever
+watches the repository, which makes the repository the pager without running
+anything else. The payload inside is unchanged, so the same setting works for
+any receiver that wants a bearer header.
 
 ## Sandbox mode
 
@@ -394,9 +410,11 @@ delete, add again does not go around it.
 
 Honest limits. The cap is global because there is no honest way to tell
 visitors apart without accounts, so three strangers can use up the day
-between them. The cap check and the insert are made atomic with a process
-lock, which is correct for the one-process deployment and would need to move
-into the database before a second process. Two holes stay open on purpose,
+between them. The cap itself is held by the database: each addition claims a
+numbered slot for the day in `sandbox_slots`, and a unique index on (day,
+slot) refuses the second claim on the same number from any process. A process
+lock sits on top only to turn a race within one process into a queue. Two
+holes stay open on purpose,
 because closing them means changing the vendored check engine: DNS rebinding,
 where a name resolves publicly when added and privately when checked, and a
 public target that redirects to a private address, since the engine follows
@@ -415,7 +433,7 @@ test in `tests/test_hardening.py` so it stays fixed.
 | Found | Now |
 |---|---|
 | `http://127.1/`, `0x7f000001` and `2130706433` are loopback to the resolver but not to `ipaddress`, so a visitor could point a monitor at the machine itself | Literals are parsed the way the resolver parses them, multicast and reserved ranges are refused, and names are resolved and refused if any address is private |
-| Twelve simultaneous visitors got six monitors through a cap of three, and three of them got 500s from lock contention | The cap check and the insert hold a process lock. Exactly three succeed, nine get a clean 429 |
+| Twelve simultaneous visitors got six monitors through a cap of three, and three of them got 500s from lock contention | Each addition claims a numbered slot in the database under a unique index, with a process lock on top. Exactly three succeed, nine get a clean 429, from any number of processes |
 | Check-now had no limit for visitors, so a loop of POSTs made the demo a request source aimed at the seeded targets, from the demo's own IP | Thirty second cooldown per monitor for visitors, 429 with `Retry-After` |
 | A visitor's flapping monitor reached the webhook once a minute | Visitor monitors are logged, never sent |
 | Path ids past 64 bits, a kilobyte of `[`, and bodies of any size all produced 500s | 404, 400, and a 64KB limit that answers 413 before parsing |
@@ -446,6 +464,7 @@ leak. See "Sandbox mode" for the cap's other honest limits.
 | `DELETE` | `/api/monitors/<id>` | Delete a monitor and its history |
 | `POST` | `/api/monitors/<id>/check` | Run one check immediately |
 | `GET` | `/api/monitors/<id>/history?limit=N` | Recent results, newest first |
+| `GET` | `/api/monitors/<id>/rollups` | One row per day with counts and latency, and the uptime figure |
 | `GET` | `/api/status` | Rollup: counts by status, worst severity, last check time |
 
 Reads are open. When `API_TOKEN` is set, the three write endpoints (`POST` and
@@ -535,6 +554,7 @@ which for a monitoring tool is not a hypothetical situation.
 - Latency, relative last-checked time, and check interval
 - Failure category and severity shown on failing monitors
 - A bar strip of the last 30 results per monitor, height scaled to latency
+- Uptime over the last 90 days on each card, from the daily rollups
 - A form to add a monitor, and a check-now button per monitor. When the
   service has `API_TOKEN` set, the first refused change asks for the token
   once and remembers it in the browser. In sandbox mode a note above the list
@@ -584,6 +604,8 @@ gunicorn --bind 127.0.0.1:8080 --workers 1 --threads 8 \
 | `APP_ROLE` | unset | `web` opts a process out of the scheduler entirely |
 | `RETENTION_DAYS` | `30` | Delete check results older than this, checked hourly by the scheduler. `0` keeps everything |
 | `ALERT_WEBHOOK_URL` | unset | POST a JSON payload here on every monitor status change. Unset means no alerting |
+| `ALERT_WEBHOOK_AUTHORIZATION` | unset | Sent verbatim as the `Authorization` header on that POST |
+| `ALERT_WEBHOOK_FORMAT` | `json` | `github` wraps the payload for `repository_dispatch` so a repository can be the receiver |
 | `API_TOKEN` | unset | When set, `POST` and `DELETE` under `/api` need `Authorization: Bearer <token>`. Unset means writes are open |
 | `SANDBOX` | `0` | With `API_TOKEN`, let visitors add capped, expiring monitors. See "Sandbox mode" |
 | `SANDBOX_MAX_PER_DAY` | `3` | Visitor additions allowed per UTC day, across all visitors. Resets at midnight UTC |
@@ -617,7 +639,7 @@ pytest -v
 ruff check .
 ```
 
-233 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
+250 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
 scheduler tests pass `now` in explicitly rather than waiting, so a lease can be
 aged past its 90 second timeout without the suite taking 90 seconds.
 
@@ -644,10 +666,12 @@ Honest about what this is not:
   a minute. It is the reason the deploy runs a single machine: a second one
   would get its own volume and therefore its own separate database. Moving to
   Postgres is a `DATABASE_URL` change, which the code already supports.
-- **One copy of the data.** The database is a file on one Fly volume. Fly
-  snapshots it daily and keeps five days, and DEPLOY.md has the restore and
-  offsite-copy steps, but nothing runs them on a schedule. Lose the volume
-  with no copy elsewhere and the history is gone.
+- **One live copy of the data.** The database is a file on one Fly volume.
+  Fly snapshots it daily and keeps five days, and a GitHub Actions workflow
+  pulls a consistent copy off the volume every night and keeps it for 30
+  days as an artifact. That is a backup, not a replica: losing the volume
+  costs up to a day of history and a restore by hand, which DEPLOY.md walks
+  through.
 - **A lease, not a distributed lock.** See the scheduler section. There is a
   narrow window in which two schedulers could overlap and write a duplicate row.
   Acceptable for monitoring history, not for anything transactional.
@@ -662,9 +686,10 @@ Honest about what this is not:
 - **Alerting is one webhook, fire and forget.** No retries, no queue, no
   routing by severity, no quiet hours. A flapping monitor alerts on every flip.
   Enough to wire into a pager through an adapter, not a paging system itself.
-- **Retention is deletion, not rollup.** Rows past `RETENTION_DAYS` are gone
-  and nothing summarised replaces them, so long-range uptime numbers are not
-  answerable from this database.
+- **Rollups are daily and coarse.** Counts and mean and maximum latency per
+  monitor per day survive retention; percentiles and anything finer than a
+  day do not. Uptime is ok against ok plus fail, with unknown reported
+  separately, and today's figure is up to an hour behind.
 - **AWS checks are untested against live AWS.** The engine supports S3 and EC2
   monitors and the API accepts them, but the deployed demo has no AWS
   credentials, so only HTTP monitors are exercised end to end.

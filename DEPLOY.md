@@ -216,6 +216,39 @@ visitor tries to change something and keeps it in that browser's localStorage.
 To rotate, set a new value with the same command. To open writes again,
 `fly secrets unset API_TOKEN`.
 
+### Alerts as GitHub issues
+
+Any receiver that takes JSON works. The demo uses this repository, which
+costs nothing and emails you: a failing monitor opens an issue, a recovering
+one closes it. Three settings, set together as secrets since one is a token:
+
+1. Create a fine-grained personal access token at
+   github.com/settings/personal-access-tokens with access to this repository
+   only and the **Contents: read and write** permission, which is what
+   `repository_dispatch` requires. Give it an expiry you will remember.
+2. Set the three values:
+
+```bash
+fly secrets set -a apihealthchecker \
+  ALERT_WEBHOOK_URL=https://api.github.com/repos/<owner>/<repo>/dispatches \
+  ALERT_WEBHOOK_FORMAT=github \
+  ALERT_WEBHOOK_AUTHORIZATION="Bearer <the token>"
+```
+
+3. Confirm, then cause a transition on a monitor that is not a sandbox one
+   (sandbox monitors never alert), for example with the operator token:
+
+```bash
+curl -s https://<app-name>.fly.dev/health              # "alerting": {..., "format": "github"}
+fly logs --no-tail | grep -E "alert_sent|alert_failed"   # GitHub answers 204
+gh run list --workflow=alerts.yml --limit 3
+gh issue list --label monitor-alert
+```
+
+`alert_failed` with a 401 or 404 means the token or the URL is wrong. Each
+dispatch appears as an `alerts` workflow run, and the issue it opened or closed
+is in the run log.
+
 ### Sandbox mode
 
 With the token set, visitors can only look. To let them try adding a monitor
@@ -335,9 +368,25 @@ Open the result with any SQLite client, or point a local run at it with
 `DB_PATH`. Verified against the live demo: the copy passes
 `pragma integrity_check` and has the same row counts as the source.
 
-There is no scheduled offsite backup. For a demo that is the right call. For
-anything whose history matters, cron the two commands above somewhere that is
-not Fly, or move to Postgres and use its tooling.
+**The scheduled copy.** `.github/workflows/backup.yml` runs those two commands
+every night at 03:17 UTC on a GitHub runner, checks the copy with
+`pragma integrity_check`, and stores it as a workflow artifact for 30 days. It
+uses the same `FLY_API_TOKEN` secret as the deploy. To take one now, or to
+confirm it works after a change:
+
+```bash
+gh workflow run backup.yml
+gh run list --workflow=backup.yml --limit 1
+```
+
+The artifact is on the run's page under Artifacts, or:
+
+```bash
+gh run download <run-id> --name apihealthchecker-db-<run-id>
+```
+
+It is offsite from Fly and inside an account you already log in to. It is
+not a replica: a restore is the file, `DB_PATH`, and a redeploy.
 
 ### Scaling past one machine
 
