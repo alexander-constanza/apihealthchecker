@@ -16,6 +16,7 @@ from apihealthchecker.classifier import classify_failure
 from apihealthchecker.db import CheckResultRow, Monitor, SessionLocal, utcnow
 from apihealthchecker.engine import Status, run_checks
 from apihealthchecker.notifier import notify_transitions, previous_statuses
+from apihealthchecker.sandbox import sandbox_enabled, sandbox_entries_for
 
 logger = logging.getLogger("apihealthchecker")
 
@@ -116,6 +117,9 @@ def run_monitors(monitors: list[Monitor], session=None, max_workers: int = DEFAU
         monitor_ids = [m.id for m in monitors]
         # Read before writing: once the new rows are in, "previous" is gone.
         previous = previous_statuses(session, monitor_ids)
+        # Visitor monitors never reach the webhook. A visitor could otherwise
+        # point one at a target that flaps and page the operator once a minute.
+        muted = set(sandbox_entries_for(session, monitor_ids)) if sandbox_enabled() else set()
 
         started = time.monotonic()
         results = run_checks(entries, max_workers=max_workers)
@@ -139,7 +143,7 @@ def run_monitors(monitors: list[Monitor], session=None, max_workers: int = DEFAU
         # After the commit, on purpose. The webhook is the one network call in
         # this module that is not a check, and it must not be able to fail a
         # write or hold the transaction open while it waits.
-        notify_transitions(previous, rows)
+        notify_transitions(previous, rows, muted=muted)
         return rows
     finally:
         if owns_session:

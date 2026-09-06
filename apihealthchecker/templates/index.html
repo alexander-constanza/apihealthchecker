@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>apihealthchecker</title>
-<style>
+<style nonce="{{ csp_nonce }}">
 /* Everything is inline on purpose: no CDN, no build step, no external font.
    The page has to render correctly on a machine with no internet access,
    which for a monitoring tool is not a hypothetical situation. */
@@ -138,6 +138,7 @@ h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
 .badge.pending { color: var(--pending); background: var(--pending-bg); }
 .card.fail .badge.fail { background: var(--panel); }
 .badge.sev { color: var(--fail); background: var(--panel); border: 1px solid var(--fail); }
+.field .narrow { width: 96px; }
 .badge.sandbox { color: var(--muted); background: var(--panel); border: 1px dashed var(--muted); }
 .sandbox-note { font-size: 12.5px; color: var(--muted); margin: 0 0 10px; padding: 7px 11px; border: 1px dashed var(--muted); border-radius: 6px; }
 
@@ -289,7 +290,7 @@ footer a { color: var(--accent); }
     </div>
     <div class="field">
       <label for="f-interval">Interval (s)</label>
-      <input id="f-interval" name="interval_seconds" type="number" value="60" min="10" max="86400" style="width:96px">
+      <input id="f-interval" name="interval_seconds" type="number" value="60" min="10" max="86400" class="narrow">
     </div>
     <button type="submit">Add</button>
     <button type="button" id="add-cancel">Cancel</button>
@@ -308,7 +309,7 @@ footer a { color: var(--accent); }
 
 </div>
 
-<script>
+<script nonce="{{ csp_nonce }}">
 "use strict";
 
 var REFRESH_MS = 15000;

@@ -34,6 +34,9 @@ are documented in the README.
 import ipaddress
 import logging
 import os
+import socket
+import threading
+import time
 from datetime import timedelta
 from urllib.parse import urlsplit
 
@@ -46,7 +49,19 @@ logger = logging.getLogger("apihealthchecker")
 
 DEFAULT_MAX_PER_DAY = 3
 DEFAULT_TTL_HOURS = 24
+DEFAULT_CHECK_COOLDOWN_SECONDS = 30
 MIN_VISITOR_INTERVAL_SECONDS = 60
+
+# The cap is checked and then the row is inserted. Two visitors doing that at
+# the same moment could both pass the check, and with SQLite the loser tends
+# to hit a lock error rather than a clean 429. The deployment is one process,
+# so a process lock makes count-then-insert atomic. A second process would
+# need the check moved into the database; see the README.
+create_lock = threading.Lock()
+
+# monitor id -> monotonic time of the last visitor check-now. Also per process.
+_manual_checks: dict[int, float] = {}
+_manual_checks_lock = threading.Lock()
 
 
 def _int_env(name: str, default: int) -> int:
@@ -77,6 +92,38 @@ def ttl_hours() -> int:
     return _int_env("SANDBOX_TTL_HOURS", DEFAULT_TTL_HOURS)
 
 
+def check_cooldown_seconds() -> int:
+    return _int_env("SANDBOX_CHECK_COOLDOWN_SECONDS", DEFAULT_CHECK_COOLDOWN_SECONDS)
+
+
+def check_cooldown_remaining(monitor_id: int, now: float | None = None) -> int:
+    """Seconds until a visitor may check-now this monitor again. Zero means go.
+
+    Check-now is an outbound request to someone else's server on demand. With
+    no limit, a loop of POSTs turns the demo into a request source pointed at
+    whatever the seeded monitors target, and it is the demo's IP that gets
+    blocked for it.
+    """
+    now = time.monotonic() if now is None else now
+    with _manual_checks_lock:
+        last = _manual_checks.get(monitor_id)
+    if last is None:
+        return 0
+    remaining = check_cooldown_seconds() - (now - last)
+    return max(int(remaining + 0.999), 0)
+
+
+def record_manual_check(monitor_id: int, now: float | None = None) -> None:
+    now = time.monotonic() if now is None else now
+    with _manual_checks_lock:
+        _manual_checks[monitor_id] = now
+        if len(_manual_checks) > 1000:
+            # Bounded: drop anything older than the cooldown.
+            cutoff = now - check_cooldown_seconds()
+            for key in [k for k, v in _manual_checks.items() if v < cutoff]:
+                del _manual_checks[key]
+
+
 def visitor_may(method: str, path: str) -> bool:
     """Which write requests a visitor may make at all. The routes apply the rest.
 
@@ -92,29 +139,78 @@ def visitor_may(method: str, path: str) -> bool:
     return False
 
 
-def is_public_hostname(target: str) -> bool:
-    """Reject the obvious ways of pointing the service at something private.
+def _ip_is_public(ip) -> bool:
+    return ip.is_global and not ip.is_multicast and not ip.is_reserved
 
-    IP literals are checked against the private, loopback, link-local and
-    reserved ranges. Names are checked for localhost and the internal-only
-    suffixes. A public name that resolves to a private address gets through;
-    catching that needs a DNS lookup at validation time and again at check
-    time, and is out of scope for a demo cap.
+
+def _parse_ip(host: str):
+    """An IP address if the host is one, in any spelling the resolver would accept.
+
+    `ipaddress` only takes dotted quads. The system resolver also takes
+    `127.1`, `0x7f000001`, `2130706433` and `017700000001`, all of which are
+    127.0.0.1, so a check that only used `ipaddress` was a loopback bypass.
+    """
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(host))
+    except (OSError, ValueError):
+        return None
+
+
+def _resolve(host: str) -> list[str]:
+    """Addresses the host resolves to right now. Empty if it does not resolve."""
+    try:
+        return sorted({info[4][0] for info in socket.getaddrinfo(host, None)})
+    except (socket.gaierror, UnicodeError, OSError):
+        return []
+
+
+def is_public_hostname(target: str) -> bool:
+    """Reject the ways of pointing the service at something private.
+
+    IP literals, in every spelling the resolver accepts, are checked against
+    the private, loopback, link-local, multicast and reserved ranges. Names are
+    checked for localhost and the internal-only suffixes, then resolved, and
+    rejected if any address they resolve to is not public. A name that does
+    not resolve is allowed: it fails as a check, which is harmless.
+
+    What is left: DNS rebinding (a name that resolves publicly now and
+    privately at check time), and a public target that redirects to a private
+    address, since the vendored engine follows redirects. The response body is
+    never stored, so what leaks in both cases is a status code.
     """
     host = (urlsplit(target).hostname or "").rstrip(".").lower()
     if not host or host == "localhost":
         return False
     if host.endswith((".localhost", ".local", ".internal", ".home.arpa", ".lan")):
         return False
-    try:
-        return ipaddress.ip_address(host).is_global
-    except ValueError:
+    ip = _parse_ip(host)
+    if ip is not None:
+        return _ip_is_public(ip)
+    if "." not in host:
         # A bare word like "intranet" or "db" is a network-local name.
-        return "." in host
+        return False
+    for resolved in _resolve(host):
+        parsed = _parse_ip(resolved)
+        if parsed is None or not _ip_is_public(parsed):
+            return False
+    return True
 
 
 def visitor_rejection(cleaned: dict) -> tuple[dict, int] | None:
     """The extra rules a visitor's monitor has to meet, as a (body, status) error."""
+    if cleaned.get("type", "http") != "http":
+        return (
+            {
+                "error": "invalid_field",
+                "field": "type",
+                "message": "In sandbox mode only http monitors can be added",
+            },
+            400,
+        )
     if not is_public_hostname(cleaned["target"]):
         return (
             {

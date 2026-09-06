@@ -4,8 +4,11 @@ The request-lifecycle patterns here (request-id propagation, JSON access logs,
 the HTTPException-vs-Exception handler split, the app factory) are ported from
 github.com/alexander-constanza/api-debugging-toolkit. See the comments on each.
 """
+import contextlib
 import logging
 import os
+import re
+import secrets
 import time
 import uuid
 
@@ -34,8 +37,11 @@ from apihealthchecker.notifier import webhook_url
 from apihealthchecker.runner import run_single
 from apihealthchecker.sandbox import (
     additions_remaining,
+    check_cooldown_remaining,
+    create_lock,
     is_protected,
     max_per_day,
+    record_manual_check,
     register_sandbox_monitor,
     sandbox_enabled,
     sandbox_entries_for,
@@ -53,6 +59,17 @@ logger = logging.getLogger("apihealthchecker")
 # How many recent results the UI draws in each monitor's history strip.
 SPARKLINE_POINTS = 30
 
+MAX_BODY_BYTES = 64 * 1024
+
+# SQLite row ids are signed 64-bit. A path id above that reaches the driver as
+# a Python int it cannot bind and comes back as a 500. It is a 404.
+MAX_ROW_ID = 2**63 - 1
+
+# An inbound X-Request-Id is echoed on the response and written to the logs.
+# Anything outside this set is replaced rather than passed through: a newline
+# in a header value is a response-splitting attempt, or at best a crash.
+REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,200}")
+
 
 def create_app(start_background_scheduler: bool | None = None) -> Flask:
     """Application factory.
@@ -69,6 +86,10 @@ def create_app(start_background_scheduler: bool | None = None) -> Flask:
     configure_logging()
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
+    # The largest legitimate body is a monitor definition, a few hundred bytes.
+    # Anything bigger is refused with 413 before it is read into memory or
+    # handed to the JSON parser.
+    app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
 
     init_db()
 
@@ -111,8 +132,9 @@ def _register_lifecycle(app: Flask) -> None:
     @app.before_request
     def start_request():
         incoming = request.headers.get("X-Request-Id", "")
-        g.request_id = incoming if 0 < len(incoming) <= 200 else str(uuid.uuid4())
+        g.request_id = incoming if REQUEST_ID_PATTERN.fullmatch(incoming) else str(uuid.uuid4())
         g.start_time = time.time()
+        g.csp_nonce = secrets.token_urlsafe(16)
         logger.info(
             "request_started",
             extra={
@@ -162,6 +184,24 @@ def _register_lifecycle(app: Flask) -> None:
             },
         )
         response.headers["X-Request-Id"] = g.get("request_id", "unknown")
+        # The page is inline CSS and JS by design (it must render offline), so
+        # the policy allows exactly the inline blocks carrying this request's
+        # nonce and nothing else: no other scripts, no framing, no forms to
+        # other origins, and fetch only to this origin.
+        nonce = g.get("csp_nonce", "")
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; "
+            f"script-src 'nonce-{nonce}'; "
+            f"style-src 'nonce-{nonce}'; "
+            "connect-src 'self'; "
+            "img-src 'self' data:; "
+            "base-uri 'none'; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
     @app.teardown_appcontext
@@ -179,7 +219,15 @@ def _json_body() -> tuple[dict | None, tuple[dict, int] | None]:
     silent=True so unparseable JSON is a 400 with an explanation rather than a
     werkzeug BadRequest that would surface as a bare error page.
     """
-    data = request.get_json(silent=True)
+    try:
+        data = request.get_json(silent=True)
+    except RecursionError:
+        # silent=True swallows bad JSON but not a body nested deeper than the
+        # parser's stack. A kilobyte of "[" is enough to get here.
+        return None, (
+            {"error": "invalid_json", "message": "Request body is nested too deeply"},
+            400,
+        )
     if data is None:
         return None, ({"error": "invalid_json", "message": "Request body must be valid JSON"}, 400)
     if not isinstance(data, dict):
@@ -227,6 +275,13 @@ def _latest_results(session, monitor_ids: list[int], per_monitor: int = SPARKLIN
     return grouped
 
 
+def _get_monitor(session, monitor_id: int):
+    """A monitor by id, or None for a missing one or an id the database cannot hold."""
+    if monitor_id > MAX_ROW_ID:
+        return None
+    return session.get(Monitor, monitor_id)
+
+
 def _monitor_view(monitor: Monitor, results: list, sandbox_entry=None) -> dict:
     """A monitor plus its latest state and recent history, as the UI wants it."""
     latest = results[0] if results else None
@@ -250,7 +305,7 @@ def _monitor_view(monitor: Monitor, results: list, sandbox_entry=None) -> dict:
 def _register_api(app: Flask) -> None:
     @app.route("/", methods=["GET"])
     def index():
-        return render_template("index.html")
+        return render_template("index.html", csp_nonce=g.csp_nonce)
 
     @app.route("/health", methods=["GET"])
     def health():
@@ -310,7 +365,9 @@ def _register_api(app: Flask) -> None:
             if rejection is not None:
                 body, status = rejection
                 return jsonify(body), status
-            if additions_remaining(session) <= 0:
+        # Visitors take the lock so the cap check and the insert are one step.
+        with create_lock if visitor else contextlib.nullcontext():
+            if visitor and additions_remaining(session) <= 0:
                 return jsonify(
                     {
                         "error": "sandbox_limit",
@@ -320,12 +377,19 @@ def _register_api(app: Flask) -> None:
                         ),
                     }
                 ), 429
+            try:
+                monitor = Monitor(**cleaned)
+                session.add(monitor)
+                session.flush()
+                entry = register_sandbox_monitor(session, monitor) if visitor else None
+                session.commit()
+            except SQLAlchemyError:
+                session.rollback()
+                logger.exception(
+                    "monitor_create_failed", extra={"request_id": g.get("request_id", "unknown")}
+                )
+                return jsonify({"error": "database_error"}), 500
         try:
-            monitor = Monitor(**cleaned)
-            session.add(monitor)
-            session.flush()
-            entry = register_sandbox_monitor(session, monitor) if visitor else None
-            session.commit()
             session.refresh(monitor)
             logger.info(
                 "monitor_created",
@@ -348,7 +412,7 @@ def _register_api(app: Flask) -> None:
     @app.route("/api/monitors/<int:monitor_id>", methods=["DELETE"])
     def delete_monitor(monitor_id: int):
         session = SessionLocal()
-        monitor = session.get(Monitor, monitor_id)
+        monitor = _get_monitor(session, monitor_id)
         if monitor is None:
             return jsonify(
                 {"error": "not_found", "message": f"No monitor with id {monitor_id}"}
@@ -374,11 +438,25 @@ def _register_api(app: Flask) -> None:
     @app.route("/api/monitors/<int:monitor_id>/check", methods=["POST"])
     def check_monitor(monitor_id: int):
         session = SessionLocal()
-        monitor = session.get(Monitor, monitor_id)
+        monitor = _get_monitor(session, monitor_id)
         if monitor is None:
             return jsonify(
                 {"error": "not_found", "message": f"No monitor with id {monitor_id}"}
             ), 404
+        if sandbox_enabled() and not g.get("operator", True):
+            wait = check_cooldown_remaining(monitor_id)
+            if wait:
+                response = jsonify(
+                    {
+                        "error": "cooldown",
+                        "message": f"This monitor was checked recently. Try again in {wait}s.",
+                        "retry_after_seconds": wait,
+                    }
+                )
+                response.status_code = 429
+                response.headers["Retry-After"] = str(wait)
+                return response
+            record_manual_check(monitor_id)
         try:
             row = run_single(monitor, session=session)
         except SQLAlchemyError:
@@ -397,7 +475,7 @@ def _register_api(app: Flask) -> None:
             ), 400
 
         session = SessionLocal()
-        monitor = session.get(Monitor, monitor_id)
+        monitor = _get_monitor(session, monitor_id)
         if monitor is None:
             return jsonify(
                 {"error": "not_found", "message": f"No monitor with id {monitor_id}"}

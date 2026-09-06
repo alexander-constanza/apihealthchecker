@@ -68,6 +68,18 @@ def validate_monitor(data: dict) -> tuple[dict | None, tuple[dict, int] | None]:
                 },
                 422,
             )
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            # Null bytes and escape sequences have no place in a name or a
+            # URL. They render as nothing on the page and as noise in a
+            # terminal tailing the logs.
+            return None, (
+                {
+                    "error": "invalid_field",
+                    "field": field,
+                    "message": f"{field} must not contain control characters",
+                },
+                422,
+            )
 
     monitor_type = data.get("type", "http")
     if monitor_type is None:

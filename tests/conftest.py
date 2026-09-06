@@ -17,6 +17,19 @@ from apihealthchecker.app import create_app  # noqa: E402
 from apihealthchecker.db import Base, Monitor, SessionLocal, engine  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def no_dns(monkeypatch):
+    """The sandbox hostname check resolves names. Tests make no network calls,
+    so every name resolves to one public address unless a test says otherwise."""
+    monkeypatch.setattr("apihealthchecker.sandbox._resolve", lambda host: ["93.184.216.34"])
+
+
+@pytest.fixture(autouse=True)
+def fresh_cooldowns(monkeypatch):
+    """The check-now cooldown table is per process. Start each test with it empty."""
+    monkeypatch.setattr("apihealthchecker.sandbox._manual_checks", {})
+
+
 @pytest.fixture()
 def app():
     flask_app = create_app(start_background_scheduler=False)

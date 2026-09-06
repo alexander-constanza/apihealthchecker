@@ -109,16 +109,21 @@ def send_alert(payload: dict, url: str | None = None, timeout: float = ALERT_TIM
     return True
 
 
-def notify_transitions(previous: dict[int, str | None], rows: list[CheckResultRow]) -> int:
+def notify_transitions(
+    previous: dict[int, str | None], rows: list[CheckResultRow], muted: set[int] | None = None
+) -> int:
     """Log every transition and POST each one to the webhook. Returns the count sent.
 
     Called after the rows are committed, so an alert is only ever sent for a
     result that is actually stored, and a slow or failing webhook cannot roll
-    a result back.
+    a result back. Monitors in `muted` are logged but not sent: the runner
+    passes the sandbox monitors, which strangers control.
     """
     url = webhook_url()
+    muted = muted or set()
     sent = 0
     for before, row in transitions(previous, rows):
+        is_muted = row.monitor_id in muted
         logger.info(
             "monitor_status_changed",
             extra={
@@ -127,8 +132,9 @@ def notify_transitions(previous: dict[int, str | None], rows: list[CheckResultRo
                 "status": row.status,
                 "severity": row.severity,
                 "category": row.category,
+                "alert_muted": is_muted,
             },
         )
-        if url and send_alert(build_payload(row, before), url=url):
+        if url and not is_muted and send_alert(build_payload(row, before), url=url):
             sent += 1
     return sent
