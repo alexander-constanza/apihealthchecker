@@ -377,6 +377,13 @@ watches the repository, which makes the repository the pager without running
 anything else. The payload inside is unchanged, so the same setting works for
 any receiver that wants a bearer header.
 
+The first one is
+[issue #1](https://github.com/alexander-constanza/apihealthchecker/issues/1):
+an operator-added monitor pointed at a URL that returns 503, opened by the
+scheduler's first check of it. Its closing recovery was a `monitor_recovered`
+event sent by hand through the same endpoint, to exercise the close path
+without waiting for a real recovery, and the comment says so.
+
 ## Sandbox mode
 
 With `API_TOKEN` set the demo is safe and the add-monitor form is a
