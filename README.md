@@ -302,7 +302,7 @@ curl localhost:8080/health
 {
   "status": "ok",
   "dependencies": {"database": "ok"},
-  "scheduler": {"running_in_this_process": true, "owner": "287e610c732d58:654:9c1f2e"},
+  "scheduler": {"running_in_this_process": true, "owner": "287e610c732d58:654:158f1c"},
   "alerting": {"webhook_configured": false}
 }
 ```
