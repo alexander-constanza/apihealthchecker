@@ -188,6 +188,34 @@ secret was pasted wrong.
 Retention needs nothing set. `RETENTION_DAYS` defaults to 30 and can be changed
 in the `[env]` block of `fly.toml`.
 
+### Protecting writes
+
+Without `API_TOKEN`, anyone who can reach the service can add, delete and
+trigger monitors. That is fine on a laptop and not fine on a public URL. Make
+a token and set it as a secret:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+fly secrets set API_TOKEN=<the value printed>
+```
+
+The machine restarts. Confirm the mode, then confirm a write is refused
+without the token and accepted with it:
+
+```bash
+curl -s https://<app-name>.fly.dev/health            # "auth": {"write_token_required": true}
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<app-name>.fly.dev/api/monitors/1/check
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<app-name>.fly.dev/api/monitors/1/check \
+  -H "Authorization: Bearer <the value printed>"
+```
+
+Expect `401` then `201`. Reads (`/`, `/health`, `/api/status`, `/api/monitors`,
+history) never need it. The status page asks for the token the first time a
+visitor tries to change something and keeps it in that browser's localStorage.
+
+To rotate, set a new value with the same command. To open writes again,
+`fly secrets unset API_TOKEN`.
+
 ### Verifying the volume actually persisted
 
 The point of the volume is that this survives a deploy:
@@ -238,8 +266,56 @@ scheduler is not running anywhere and the machine needs a restart.
   each its own volume and therefore its own separate database. That is the point
   at which SQLite should be swapped for Postgres. See "Scope and limitations" in
   the README.
-- Volumes are not backed up by default. `fly volumes snapshots list <volume-id>`
-  shows what automatic snapshots exist.
+- A volume is one copy of the data on one drive. Fly snapshots it daily, but
+  see "Backups" below for what that does and does not cover.
+
+### Backups
+
+The database is one file on one volume, and a volume is one copy on one drive.
+Fly's own documentation is direct about it: if that drive fails, the data is
+gone. Three layers, from free to deliberate:
+
+**Automatic snapshots.** Fly takes a snapshot of every volume once a day and
+keeps five days by default. The first one appears within a day of the volume
+being created. List them, and change the retention window, with:
+
+```bash
+fly volumes snapshots list <volume-id>
+fly volumes update <volume-id> --snapshot-retention 14
+```
+
+A snapshot is a point-in-time copy from up to a day ago, stored by the same
+provider in the same region. It covers a bad deploy or a fat-fingered delete.
+It does not cover the provider, the region, or the account.
+
+**Restore from a snapshot.** Snapshots restore into a new volume, not the
+existing one:
+
+```bash
+fly volumes snapshots list <volume-id>            # pick a snapshot id
+fly volumes create apihealthchecker_data --region lhr --size 1 --snapshot-id <snapshot-id>
+```
+
+Then attach the machine to the new volume, or destroy the machine and let
+`fly deploy` create one against it. The volume name must still match
+`fly.toml`.
+
+**A copy you hold.** SQLite's online backup API produces a consistent copy
+while the service is running, which a plain file copy of a live database does
+not. Two commands, and the file lands on your machine:
+
+```bash
+fly ssh console -C "python -c \"import sqlite3; s = sqlite3.connect('/data/apihealthchecker.db'); d = sqlite3.connect('/tmp/backup.db'); s.backup(d); d.close()\""
+fly ssh sftp get /tmp/backup.db ./apihealthchecker-$(date +%F).db
+```
+
+Open the result with any SQLite client, or point a local run at it with
+`DB_PATH`. Verified against the live demo: the copy passes
+`pragma integrity_check` and has the same row counts as the source.
+
+There is no scheduled offsite backup. For a demo that is the right call. For
+anything whose history matters, cron the two commands above somewhere that is
+not Fly, or move to Postgres and use its tooling.
 
 ### Scaling past one machine
 

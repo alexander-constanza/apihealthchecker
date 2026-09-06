@@ -296,6 +296,13 @@ second write path a demo does not need.
 | `GET` | `/api/monitors/<id>/history?limit=N` | Recent results, newest first |
 | `GET` | `/api/status` | Rollup: counts by status, worst severity, last check time |
 
+Reads are open. When `API_TOKEN` is set, the three write endpoints (`POST` and
+`DELETE`) need `Authorization: Bearer <token>` and answer `401` without it.
+The check is a `before_request` hook keyed on method and path rather than a
+decorator per route, so a write endpoint added later is protected before
+anyone remembers to protect it. One shared token, deliberately: accounts and
+roles are what an auth proxy is for, and `auth.py` says where the line is.
+
 ### Examples
 
 ```bash
@@ -371,7 +378,9 @@ which for a monitoring tool is not a hypothetical situation.
 - Latency, relative last-checked time, and check interval
 - Failure category and severity shown on failing monitors
 - A bar strip of the last 30 results per monitor, height scaled to latency
-- A form to add a monitor, and a check-now button per monitor
+- A form to add a monitor, and a check-now button per monitor. When the
+  service has `API_TOKEN` set, the first change asks for the token once and
+  remembers it in the browser
 - Auto-refresh via `fetch` every 15 seconds
 - Dark mode via `prefers-color-scheme`
 
@@ -414,6 +423,7 @@ gunicorn --bind 127.0.0.1:8080 --workers 1 --threads 8 \
 | `APP_ROLE` | unset | `web` opts a process out of the scheduler entirely |
 | `RETENTION_DAYS` | `30` | Delete check results older than this, checked hourly by the scheduler. `0` keeps everything |
 | `ALERT_WEBHOOK_URL` | unset | POST a JSON payload here on every monitor status change. Unset means no alerting |
+| `API_TOKEN` | unset | When set, `POST` and `DELETE` under `/api` need `Authorization: Bearer <token>`. Unset means writes are open |
 
 Everything has a working default, so a fresh clone runs with no configuration
 and the same code deploys unchanged.
@@ -442,7 +452,7 @@ pytest -v
 ruff check .
 ```
 
-156 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
+169 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
 scheduler tests pass `now` in explicitly rather than waiting, so a lease can be
 aged past its 90 second timeout without the suite taking 90 seconds.
 
@@ -466,12 +476,19 @@ Honest about what this is not:
   a minute. It is the reason the deploy runs a single machine: a second one
   would get its own volume and therefore its own separate database. Moving to
   Postgres is a `DATABASE_URL` change, which the code already supports.
+- **One copy of the data.** The database is a file on one Fly volume. Fly
+  snapshots it daily and keeps five days, and DEPLOY.md has the restore and
+  offsite-copy steps, but nothing runs them on a schedule. Lose the volume
+  with no copy elsewhere and the history is gone.
 - **A lease, not a distributed lock.** See the scheduler section. There is a
   narrow window in which two schedulers could overlap and write a duplicate row.
   Acceptable for monitoring history, not for anything transactional.
-- **No authentication.** Anyone who can reach the service can add, delete and
-  trigger monitors. Put it behind an auth proxy before exposing it anywhere that
-  matters.
+- **One shared token, not accounts.** `API_TOKEN` stops strangers from
+  deleting monitors on a public instance. It does not say who did what, has no
+  roles, no rotation without a restart, and no rate limiting. The status page
+  keeps the token in the browser's localStorage after asking once, which is
+  right for an operator's own browser and wrong for a shared screen. Anything
+  beyond that is an auth proxy's job.
 - **Alerting is one webhook, fire and forget.** No retries, no queue, no
   routing by severity, no quiet hours. A flapping monitor alerts on every flip.
   Enough to wire into a pager through an adapter, not a paging system itself.
