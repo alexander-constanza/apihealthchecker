@@ -1,6 +1,7 @@
 # apihealthchecker
 
 [![tests](https://github.com/alexander-constanza/apihealthchecker/actions/workflows/test.yml/badge.svg)](https://github.com/alexander-constanza/apihealthchecker/actions/workflows/test.yml)
+[![deploy](https://github.com/alexander-constanza/apihealthchecker/actions/workflows/deploy.yml/badge.svg)](https://github.com/alexander-constanza/apihealthchecker/actions/workflows/deploy.yml)
 
 A monitoring service that continuously checks HTTP endpoints and AWS resources,
 records every result over time, classifies failures by category and severity,
@@ -413,4 +414,4 @@ Honest about what this is not:
 
 ## Licence
 
-MIT.
+MIT. See [LICENSE](LICENSE).
