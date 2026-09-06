@@ -19,10 +19,20 @@ The fix is a lease in the database, which is the one thing every worker shares:
 2. The claim succeeds only if the row does not exist, or its heartbeat is older
    than LEASE_TIMEOUT_SECONDS (the previous owner died).
 3. The winner runs the scheduler loop and rewrites its heartbeat every tick.
-   The losers serve requests and never start a loop.
-4. If the owner dies, its heartbeat goes stale and the next worker to look takes
-   over within LEASE_TIMEOUT_SECONDS. No operator action, no leader election
-   service.
+   The losers serve requests and stand by: they retry the claim every
+   STANDBY_RETRY_SECONDS and never run checks until they win.
+4. If the owner dies, its heartbeat goes stale and the next standby to retry
+   takes over within LEASE_TIMEOUT_SECONDS. No operator action, no leader
+   election service.
+5. On a clean shutdown the owner deletes its lease row, so the process that
+   replaces it claims immediately instead of waiting out the timeout.
+
+Why the losers stand by rather than give up: found on the first CI deploy to
+Fly. A deploy replaces the machine, so the new process started while the dead
+one's heartbeat was eight seconds old, declined the lease once, and never
+looked again. Checks stopped, /health stayed green, and nothing would have
+recovered it short of a restart. A single attempt at startup is only correct
+when the process that holds the lease is guaranteed to outlive you.
 
 The claim is a single transaction, so two workers racing to start cannot both
 win: SQLite serializes the write and the loser sees the row the winner just
@@ -44,6 +54,7 @@ fly.toml and the Dockerfile run one gunicorn worker with several threads, so
 there is exactly one process and the lease has nothing to arbitrate. The lease
 exists so that scaling to two workers is a config change and not an incident.
 """
+import atexit
 import logging
 import os
 import threading
@@ -64,6 +75,11 @@ LEASE_TIMEOUT_SECONDS = 90
 # interval: monitors have their own, and this is just the resolution at which
 # they are noticed.
 TICK_SECONDS = 5
+
+# How often a process that does not own the lease retries the claim. A dead
+# owner is noticed within LEASE_TIMEOUT_SECONDS plus this, so it should be small
+# next to the timeout but not so small that idle workers hammer the lock row.
+STANDBY_RETRY_SECONDS = 15
 
 LOCK_ROW_ID = 1
 
@@ -243,8 +259,13 @@ class Scheduler:
     single tick synchronously, with no sleeping and no wall-clock dependence.
     """
 
-    def __init__(self, tick_seconds: float = TICK_SECONDS):
+    def __init__(
+        self,
+        tick_seconds: float = TICK_SECONDS,
+        standby_retry_seconds: float = STANDBY_RETRY_SECONDS,
+    ):
         self.tick_seconds = tick_seconds
+        self.standby_retry_seconds = standby_retry_seconds
         self.owner = _owner_id()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -267,31 +288,72 @@ class Scheduler:
             logger.exception("scheduler_tick_failed", extra={"owner": self.owner})
             return []
 
+    def standby_tick(self, now=None) -> bool:
+        """One standby iteration: retry the lease claim. True once this process owns it.
+
+        Called instead of tick() while owns_lease is False. This is the whole
+        difference between a process that recovers after a deploy and one that
+        stays a bystander forever, so it is worth getting right: it must set
+        owns_lease on success, must not raise (a database blip here should not
+        kill the standby thread any more than it kills the running loop), and
+        should log the promotion so the handover is visible in `fly logs`.
+        """
+        try:
+            self.owns_lease = acquire_lease(owner=self.owner, now=now)
+        except Exception:
+            # acquire_lease already contains SQLAlchemyError. Anything else
+            # would kill the standby thread, which recreates the bug this
+            # method exists to fix, so it is logged and retried next round.
+            logger.exception("scheduler_standby_failed", extra={"owner": self.owner})
+            self.owns_lease = False
+            return False
+        if self.owns_lease:
+            logger.info("scheduler_standby_promoted", extra={"owner": self.owner})
+        return self.owns_lease
+
     def _loop(self) -> None:
         while not self._stop.is_set():
-            self.tick()
-            if not self.owns_lease:
-                return
-            self._stop.wait(self.tick_seconds)
+            if self.owns_lease:
+                self.tick()
+                self._stop.wait(self.tick_seconds)
+            else:
+                self.standby_tick()
+                if not self.owns_lease:
+                    self._stop.wait(self.standby_retry_seconds)
 
     def start(self) -> bool:
-        """Claim the lease and start the thread. False if another process owns it."""
+        """Start the thread. True if this process owns the lease right now.
+
+        A process that does not win the lease still gets a thread, in standby:
+        it retries the claim until it wins or is stopped. The return value says
+        who owns the lease at startup, not whether the scheduler is running.
+        """
         if not scheduler_enabled():
             logger.info("scheduler_disabled", extra={"owner": self.owner})
             return False
-        if not acquire_lease(owner=self.owner):
-            return False
 
-        self.owns_lease = True
+        self.owns_lease = acquire_lease(owner=self.owner)
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._loop, name="apihealthchecker-scheduler", daemon=True
         )
         self._thread.start()
-        logger.info("scheduler_started", extra={"owner": self.owner, "tick_s": self.tick_seconds})
-        return True
+        # gunicorn workers exit via sys.exit on SIGTERM, so atexit runs and the
+        # lease row is deleted rather than left to age out over 90 seconds.
+        atexit.register(self.stop)
+        if self.owns_lease:
+            logger.info(
+                "scheduler_started", extra={"owner": self.owner, "tick_s": self.tick_seconds}
+            )
+        else:
+            logger.info(
+                "scheduler_standby",
+                extra={"owner": self.owner, "retry_s": self.standby_retry_seconds},
+            )
+        return self.owns_lease
 
     def stop(self, timeout: float = 5.0) -> None:
+        atexit.unregister(self.stop)
         self._stop.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
@@ -303,11 +365,13 @@ class Scheduler:
 
 
 def start_scheduler(tick_seconds: float = TICK_SECONDS) -> Scheduler | None:
-    """Start the scheduler if this process wins the lease, else return None."""
+    """Start the scheduler thread, running or in standby. None only if disabled."""
     scheduler = Scheduler(tick_seconds=tick_seconds)
-    if scheduler.start():
-        return scheduler
-    return None
+    if not scheduler_enabled():
+        logger.info("scheduler_disabled", extra={"owner": scheduler.owner})
+        return None
+    scheduler.start()
+    return scheduler
 
 
 def wait_for(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:

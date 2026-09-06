@@ -20,6 +20,7 @@ from apihealthchecker.scheduler import (
     release_lease,
     run_due_checks,
     scheduler_enabled,
+    start_scheduler,
 )
 
 
@@ -219,14 +220,92 @@ def test_tick_survives_an_error_from_the_checks(session, monitor, monkeypatch):
     assert scheduler.tick() == []
 
 
-def test_scheduler_start_is_refused_when_another_process_holds_the_lease(session, monkeypatch):
+def test_scheduler_start_stands_by_when_another_process_holds_the_lease(session, monkeypatch):
+    """Losing the lease at startup no longer means giving up. The process gets
+    a standby thread that keeps retrying, which is what recovers monitoring
+    after a deploy replaces the owner."""
     monkeypatch.delenv("APP_ROLE", raising=False)
     monkeypatch.setenv("SCHEDULER_ENABLED", "1")
     acquire_lease(session=session, owner="another-worker")
 
+    scheduler = Scheduler(standby_retry_seconds=60)
+    try:
+        assert scheduler.start() is False
+        assert scheduler.owns_lease is False
+        assert scheduler._thread is not None and scheduler._thread.is_alive()
+    finally:
+        scheduler.stop()
+    assert session.get(SchedulerLock, LOCK_ROW_ID).owner == "another-worker"
+
+
+def test_standby_tick_declines_while_the_heartbeat_is_fresh(session):
     scheduler = Scheduler()
-    assert scheduler.start() is False
+    acquire_lease(session=session, owner="another-worker")
+
+    assert scheduler.standby_tick() is False
     assert scheduler.owns_lease is False
+
+
+def test_standby_tick_takes_over_once_the_heartbeat_is_stale(session):
+    """The deploy case: the old owner is dead, its heartbeat ages past the
+    timeout, and the standby process promotes itself on its next retry."""
+    scheduler = Scheduler()
+    now = utcnow()
+    acquire_lease(session=session, owner="dead-worker", now=now)
+
+    later = now + timedelta(seconds=LEASE_TIMEOUT_SECONDS + 1)
+    assert scheduler.standby_tick(now=later) is True
+    assert scheduler.owns_lease is True
+    session.expire_all()
+    assert session.get(SchedulerLock, LOCK_ROW_ID).owner == scheduler.owner
+
+
+def test_standby_tick_survives_an_error(monkeypatch):
+    """An exception here would kill the standby thread, which is exactly the
+    silent failure standby exists to prevent."""
+    scheduler = Scheduler()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr("apihealthchecker.scheduler.acquire_lease", boom)
+    assert scheduler.standby_tick() is False
+    assert scheduler.owns_lease is False
+
+
+def test_start_scheduler_returns_a_standby_scheduler_when_the_lease_is_held(session, monkeypatch):
+    """create_app keeps the object either way, so /health can report whether
+    this process is the one running checks."""
+    monkeypatch.delenv("APP_ROLE", raising=False)
+    monkeypatch.setenv("SCHEDULER_ENABLED", "1")
+    acquire_lease(session=session, owner="another-worker")
+
+    scheduler = start_scheduler()
+    try:
+        assert scheduler is not None
+        assert scheduler.owns_lease is False
+    finally:
+        scheduler.stop()
+
+
+def test_start_scheduler_returns_none_when_disabled(monkeypatch):
+    monkeypatch.setenv("APP_ROLE", "web")
+    assert start_scheduler() is None
+
+
+def test_stop_releases_the_lease(session, monkeypatch):
+    """A clean shutdown deletes the lease row, so the process that replaces
+    this one claims immediately instead of waiting out the timeout."""
+    monkeypatch.delenv("APP_ROLE", raising=False)
+    monkeypatch.setenv("SCHEDULER_ENABLED", "1")
+
+    scheduler = Scheduler()
+    assert scheduler.start() is True
+    scheduler.stop()
+
+    assert scheduler.owns_lease is False
+    session.expire_all()
+    assert session.get(SchedulerLock, LOCK_ROW_ID) is None
 
 
 def test_scheduler_start_is_refused_when_disabled(monkeypatch):

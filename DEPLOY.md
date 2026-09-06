@@ -153,6 +153,7 @@ The point of the volume is that this survives a deploy:
 curl https://<app-name>.fly.dev/api/status    # note monitor_count and last_check_at
 fly deploy
 curl https://<app-name>.fly.dev/api/status    # same monitors, history intact
+curl https://<app-name>.fly.dev/health        # running_in_this_process: true
 ```
 
 If `monitor_count` reset, the volume is not mounted where `DB_PATH` points. Check
@@ -161,6 +162,23 @@ with:
 ```bash
 fly ssh console -C "ls -la /data"
 ```
+
+The `/health` line matters as much as the other two. A deploy replaces the
+process that owns the scheduler lease, and the new one has to take it over
+before any checks run. The handover is visible in the logs:
+
+```bash
+fly logs --no-tail | grep -E "scheduler_(lease|standby|started)"
+```
+
+Normally the old process releases the lease on shutdown and the new one logs
+`scheduler_lease_acquired` with `reason=unclaimed`, then `scheduler_started`. If
+the old process was killed rather than stopped, the new one logs
+`scheduler_lease_declined` and `scheduler_standby`, retries, and logs
+`scheduler_standby_promoted` once the old heartbeat is older than 90 seconds.
+Either way `last_check_at` should move within about two minutes of the deploy.
+If it does not, and `/health` still says `running_in_this_process: false`, the
+scheduler is not running anywhere and the machine needs a restart.
 
 ### Free-tier caveats
 

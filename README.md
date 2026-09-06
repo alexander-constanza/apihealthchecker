@@ -186,9 +186,11 @@ shares:
 2. The claim succeeds only if the row is absent or its heartbeat is older than
    `LEASE_TIMEOUT_SECONDS` (90s), meaning the previous owner died.
 3. The winner runs the loop and rewrites its heartbeat every tick. The losers
-   serve requests and never start a loop.
-4. If the owner dies, the next worker to look takes over within the timeout. No
-   operator action, no leader-election service.
+   serve requests and stand by, retrying the claim every 15 seconds.
+4. If the owner dies, the next standby to retry takes over within the timeout.
+   No operator action, no leader-election service.
+5. On a clean shutdown the owner deletes its lease row, so its replacement
+   claims on the first try instead of waiting out the timeout.
 
 Verified with three real gunicorn workers:
 
@@ -196,11 +198,23 @@ Verified with three real gunicorn workers:
 scheduler_lease_acquired  owner=local:4239  reason=unclaimed
 scheduler_started         owner=local:4239  tick_s=5
 scheduler_lease_declined  owner=local:4240  held_by=local:4239
+scheduler_standby         owner=local:4240  retry_s=15
 scheduler_lease_declined  owner=local:4241  held_by=local:4239
+scheduler_standby         owner=local:4241  retry_s=15
 ```
 
 `GET /health` reports which process owns it, so this is observable in production
 rather than a claim in a README.
+
+**Why the losers stand by rather than give up.** The first version tried the
+lease once at startup and never again, which is correct only if the process
+holding it is guaranteed to outlive you. The first CI deploy to Fly showed it is
+not: a deploy replaces the machine, so the new process started while the dead
+one's heartbeat was eight seconds old, declined, and never looked again. Checks
+stopped, `/health` stayed green, and nothing short of a restart would have
+recovered it. Steps 3 and 5 above are the fix. A loser retries until it wins,
+and an owner that is shut down cleanly (gunicorn's SIGTERM on deploy) hands the
+lease over immediately.
 
 **Being honest about what this is.** It is a lease, not a distributed lock with
 fencing tokens. Between a stale heartbeat and the old owner's next tick there is
@@ -371,7 +385,7 @@ pytest -v
 ruff check .
 ```
 
-127 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
+133 tests, no network calls (HTTP is mocked with `responses`), no sleeping. The
 scheduler tests pass `now` in explicitly rather than waiting, so a lease can be
 aged past its 90 second timeout without the suite taking 90 seconds.
 

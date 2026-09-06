@@ -67,8 +67,9 @@ def create_app(start_background_scheduler: bool | None = None) -> Flask:
             "False",
         )
     if start_background_scheduler:
-        # Returns None in the workers that lose the lease. See scheduler.py for
-        # why that is the expected outcome rather than a failure.
+        # Every process gets a scheduler object. The one that wins the lease
+        # runs checks; the others sit in standby and retry. /health reports
+        # which this process is. See scheduler.py.
         app.extensions["scheduler"] = start_scheduler()
 
     return app
