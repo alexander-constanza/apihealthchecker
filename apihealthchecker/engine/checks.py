@@ -2,7 +2,7 @@
 #
 # Source: github.com/alexander-constanza/infra-health-check
 # Path in source repo: infra_health/checks.py
-# Vendored at: version 0.1.0
+# Vendored at: version 0.2.0
 #
 # Why vendored rather than installed as a dependency:
 # infra-health-check is a portfolio CLI, not a package published to PyPI, so
@@ -17,6 +17,8 @@
 # three-state Status (ok / fail / unknown), the retry semantics and the
 # thread-pool runner are unmodified upstream code. Upstream is the place to
 # fix check behaviour; changes should be made there and re-vendored.
+#
+# Regenerate with: python3 scripts/vendor_engine.py
 
 """Individual health checks against AWS resources and plain HTTP endpoints.
 
@@ -224,23 +226,37 @@ def check_http_endpoint(
     timeout_seconds: float = 5.0,
     retries: int = 0,
     retry_delay: float = 1.0,
+    proxy: str | None = None,
 ) -> CheckResult:
-    """Confirm an HTTP endpoint responds with a 2xx status within timeout."""
+    """Confirm an HTTP endpoint responds with a 2xx status within timeout.
+
+    `proxy` sends the request through an HTTP proxy instead of straight out.
+    The case it exists for is an endpoint that is deliberately not reachable
+    from the public internet: a checker running in a container with no tunnel
+    device of its own reaches a private address through a local proxy, and the
+    check itself should not have to know that is what is happening. Left unset,
+    nothing about the request changes.
+    """
     return with_retries(
-        lambda: _check_http_endpoint_once(url, timeout_seconds),
+        lambda: _check_http_endpoint_once(url, timeout_seconds, proxy),
         retries=retries,
         retry_delay=retry_delay,
     )
 
 
-def _check_http_endpoint_once(url: str, timeout_seconds: float) -> CheckResult:
+def _check_http_endpoint_once(
+    url: str, timeout_seconds: float, proxy: str | None = None
+) -> CheckResult:
     name = f"http:{url}"
+    proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
-        resp = requests.get(url, timeout=timeout_seconds)
+        resp = requests.get(url, timeout=timeout_seconds, proxies=proxies)
         detail = {
             "status_code": resp.status_code,
             "elapsed_ms": round(resp.elapsed.total_seconds() * 1000, 2),
         }
+        if proxy:
+            detail["proxy"] = proxy
         if 200 <= resp.status_code < 300:
             return CheckResult(name, Status.OK, f"Responded {resp.status_code}", detail)
         return CheckResult(name, Status.FAIL, f"Responded {resp.status_code}", detail)
@@ -248,6 +264,13 @@ def _check_http_endpoint_once(url: str, timeout_seconds: float) -> CheckResult:
         return CheckResult(name, Status.FAIL, f"Timed out after {timeout_seconds}s")
     except requests.exceptions.TooManyRedirects:
         return CheckResult(name, Status.FAIL, "Too many redirects")
+    except requests.exceptions.ProxyError:
+        # Subclasses ConnectionError, so this has to come first: without it a
+        # dead proxy is reported as a dead endpoint and the operator goes and
+        # restarts a service that was never down.
+        return CheckResult(
+            name, Status.UNKNOWN, f"Could not reach proxy {proxy}", {"proxy": proxy}
+        )
     except requests.exceptions.ConnectionError:
         return CheckResult(name, Status.FAIL, "Connection failed")
     except requests.exceptions.MissingSchema as exc:

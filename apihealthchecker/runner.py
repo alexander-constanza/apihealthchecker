@@ -9,8 +9,11 @@ It contains no checking logic and no HTTP logic of its own. That is the point.
 The one addition is a call to the notifier after each batch is committed, so a
 status change becomes a webhook without the runner knowing what a webhook is.
 """
+import ipaddress
 import logging
+import os
 import time
+from urllib.parse import urlparse
 
 from apihealthchecker.classifier import classify_failure
 from apihealthchecker.db import CheckResultRow, Monitor, SessionLocal, utcnow
@@ -36,7 +39,46 @@ def monitor_to_entry(monitor: Monitor, timeout_seconds: float = DEFAULT_TIMEOUT_
         return {"type": "s3", "bucket_name": monitor.target}
     if monitor.type == "ec2":
         return {"type": "ec2", "instance_id": monitor.target}
-    return {"type": "http", "url": monitor.target, "timeout": timeout_seconds}
+    if monitor.type == "tailscale_path":
+        return {"type": "tailscale_path", "peer": monitor.target, "timeout": timeout_seconds}
+    return {
+        "type": "http",
+        "url": monitor.target,
+        "timeout": timeout_seconds,
+        "proxy": tailnet_proxy_for(monitor.target),
+    }
+
+
+def tailnet_proxy_for(target: str) -> str | None:
+    """Return the proxy an http monitor should use, or None to go direct.
+
+    Only tailnet targets are proxied, and only when TAILNET_HTTP_PROXY names a
+    proxy to use. Everything else keeps going straight out, which matters more
+    than it looks: routing the public monitors through the tunnel would put
+    tailscaled on the critical path of every check, so a tunnel that died would
+    report the whole internet as down.
+
+    A tailnet target is a MagicDNS name or an address in Tailscale's slice of
+    the CGNAT range, 100.64.0.0/10. The membership test is deliberately a
+    string and prefix test rather than a DNS lookup: the point of this function
+    is to decide how to reach a name, so it cannot depend on already being able
+    to resolve it.
+    """
+    proxy = os.environ.get("TAILNET_HTTP_PROXY")
+    if not proxy:
+        return None
+    host = (urlparse(target).hostname or "").lower()
+    if not host:
+        return None
+    if host.endswith(".ts.net"):
+        return proxy
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if address.version == 4 and address in ipaddress.ip_network("100.64.0.0/10"):
+        return proxy
+    return None
 
 
 def _latency_from(result_detail: dict | None, wall_ms: float | None) -> float | None:

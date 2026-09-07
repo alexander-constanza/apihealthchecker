@@ -3,7 +3,13 @@ import responses
 
 from apihealthchecker.db import CheckResultRow, Monitor, utcnow
 from apihealthchecker.engine import CheckResult, Status
-from apihealthchecker.runner import monitor_to_entry, record_result, run_monitors, run_single
+from apihealthchecker.runner import (
+    monitor_to_entry,
+    record_result,
+    run_monitors,
+    run_single,
+    tailnet_proxy_for,
+)
 from apihealthchecker.seed import SEED_MONITORS, seed_monitors
 
 
@@ -177,3 +183,53 @@ def test_seed_includes_a_deliberate_failure_case():
     targets = [s["target"] for s in SEED_MONITORS]
     assert any("no-such-pkg" in t for t in targets)
     assert any("this-host-does-not-exist" in t for t in targets)
+
+
+def test_monitor_to_entry_tailscale_path():
+    entry = monitor_to_entry(Monitor(name="x", target="ec2-api", type="tailscale_path"))
+    assert entry["type"] == "tailscale_path"
+    assert entry["peer"] == "ec2-api"
+
+
+def test_public_http_monitors_are_not_proxied(monkeypatch):
+    """The tunnel must not sit on the critical path of every check.
+
+    If it did, a dead tunnel would report the entire public internet as down,
+    which is a worse failure than the one the tunnel was added to solve.
+    """
+    monkeypatch.setenv("TAILNET_HTTP_PROXY", "http://localhost:1055")
+    entry = monitor_to_entry(Monitor(name="x", target="https://api.github.com", type="http"))
+    assert entry["proxy"] is None
+
+
+def test_tailnet_http_monitors_are_proxied(monkeypatch):
+    monkeypatch.setenv("TAILNET_HTTP_PROXY", "http://localhost:1055")
+    entry = monitor_to_entry(
+        Monitor(name="x", target="http://ec2-api.tail1234.ts.net/health", type="http")
+    )
+    assert entry["proxy"] == "http://localhost:1055"
+
+
+def test_tailnet_cgnat_addresses_are_proxied(monkeypatch):
+    monkeypatch.setenv("TAILNET_HTTP_PROXY", "http://localhost:1055")
+    assert tailnet_proxy_for("http://100.101.102.103:8080/health") == "http://localhost:1055"
+
+
+def test_addresses_just_outside_the_tailscale_range_are_not_proxied(monkeypatch):
+    """100.64.0.0/10 ends at 100.127.255.255. 100.128.0.0 is ordinary public
+    space and must not be routed into the tunnel."""
+    monkeypatch.setenv("TAILNET_HTTP_PROXY", "http://localhost:1055")
+    assert tailnet_proxy_for("http://100.128.0.1/health") is None
+    assert tailnet_proxy_for("http://100.63.255.255/health") is None
+    assert tailnet_proxy_for("http://100.64.0.1/health") == "http://localhost:1055"
+
+
+def test_nothing_is_proxied_when_no_proxy_is_configured(monkeypatch):
+    monkeypatch.delenv("TAILNET_HTTP_PROXY", raising=False)
+    assert tailnet_proxy_for("http://ec2-api.tail1234.ts.net/health") is None
+
+
+def test_a_malformed_target_does_not_raise(monkeypatch):
+    monkeypatch.setenv("TAILNET_HTTP_PROXY", "http://localhost:1055")
+    assert tailnet_proxy_for("not a url") is None
+    assert tailnet_proxy_for("") is None

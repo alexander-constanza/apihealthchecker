@@ -20,6 +20,7 @@ from apihealthchecker.engine.checks import (
     with_retries,
 )
 from apihealthchecker.engine.config import run_checks
+from apihealthchecker.engine.tailscale import check_tailscale_path, diagnose_path
 
 __all__ = [
     "CheckResult",
@@ -28,6 +29,8 @@ __all__ = [
     "check_ec2_instance",
     "check_http_endpoint",
     "check_s3_bucket",
+    "check_tailscale_path",
+    "diagnose_path",
     "run_checks",
     "with_retries",
 ]

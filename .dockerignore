@@ -1,0 +1,51 @@
+# The image needs four things from this directory: requirements.txt,
+# apihealthchecker/, entrypoint.sh and the Dockerfile. Everything else is
+# uploaded to the builder on every deploy and then thrown away.
+#
+# Before this file the context was 116 MB across 6,419 files, 112 MB of it a
+# local virtualenv that the image rebuilds from requirements.txt anyway. A build
+# context is not free: it is uploaded on every single deploy, so this is paid
+# repeatedly for nothing.
+
+# Local virtualenvs. The image installs its own from requirements.txt.
+.venv/
+venv/
+env/
+ENV/
+
+# Version control and CI definitions. Not needed at runtime.
+.git/
+.github/
+.gitignore
+
+# Tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Tests and docs ship in the repo, not in the image.
+tests/
+docs/
+*.md
+
+# Local databases and anything that looks like one. The production database
+# lives on the Fly volume; shipping a local copy would be both wasteful and a
+# way to leak local data into an image.
+*.db
+*.sqlite
+*.sqlite3
+
+# Local and editor state
+.DS_Store
+.idea/
+.vscode/
+.env
+.env.*
+
+# Alternative host config, not used by the Fly build
+render.yaml
+docker-compose.yml

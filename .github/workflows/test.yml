@@ -9,10 +9,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The check engine is a vendored copy of infra-health-check (see
+      # apihealthchecker/engine/checks.py). Checking it out here lets CI prove
+      # the copy still matches upstream, which is the failure mode vendoring
+      # invites: a fix lands in one repo and the other silently keeps the bug.
+      - uses: actions/checkout@v7
+        with:
+          repository: alexander-constanza/infra-health-check
+          path: .upstream/infra-health-check
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
+      - run: python3 scripts/vendor_engine.py --check --source .upstream/infra-health-check
       - run: ruff check .
       - run: pytest -v
         env:

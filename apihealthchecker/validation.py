@@ -24,7 +24,11 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-VALID_TYPES = ("http", "s3", "ec2")
+# tailscale_path checks the quality of the path to a tailnet peer, so its
+# target is a peer name rather than a URL. It is operator-only in practice
+# without any extra guard here: sandbox.py already refuses any visitor
+# addition whose type is not http, so a visitor cannot create one.
+VALID_TYPES = ("http", "s3", "ec2", "tailscale_path")
 
 MIN_INTERVAL_SECONDS = 10
 MAX_INTERVAL_SECONDS = 86400

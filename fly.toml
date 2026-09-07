@@ -20,6 +20,14 @@ primary_region = "lhr"
   # Visitors may add a few expiring monitors but cannot touch the seeded
   # ones. Needs the API_TOKEN secret to be set. See sandbox.py.
   SANDBOX = "1"
+  # The name this machine registers under in the tailnet. Only used when the
+  # TAILSCALE_AUTHKEY secret is set; without it the entrypoint starts no
+  # tunnel at all. Set the key with:
+  #   fly secrets set TAILSCALE_AUTHKEY=tskey-auth-...
+  # and make it ephemeral, pre-approved and tagged tag:monitor, so the node
+  # deregisters on every redeploy instead of accumulating dead machines that
+  # still match the ACL rules. See docs/TAILNET.md.
+  TAILSCALE_HOSTNAME = "apihealthchecker-fly"
 
 [[mounts]]
   source = "apihealthchecker_data"

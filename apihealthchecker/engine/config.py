@@ -2,7 +2,7 @@
 #
 # Source: github.com/alexander-constanza/infra-health-check
 # Path in source repo: infra_health/config.py
-# Vendored at: version 0.1.0
+# Vendored at: version 0.2.0
 #
 # Why vendored rather than installed as a dependency:
 # infra-health-check is a portfolio CLI, not a package published to PyPI, so
@@ -17,6 +17,8 @@
 # three-state Status (ok / fail / unknown), the retry semantics and the
 # thread-pool runner are unmodified upstream code. Upstream is the place to
 # fix check behaviour; changes should be made there and re-vendored.
+#
+# Regenerate with: python3 scripts/vendor_engine.py
 
 """Load a batch of checks from a YAML file, so a whole stack can be
 checked in one command instead of one resource at a time.
@@ -30,9 +32,14 @@ Example file:
         instance_id: i-0123456789abcdef0
       - type: http
         url: https://my-app.example.com/health
+      - type: tailscale_path
+        peer: ec2-api
 
 Each entry may also carry `region` and `profile` (AWS checks) to override
-whatever the ambient environment resolves to.
+whatever the ambient environment resolves to. An http entry may carry
+`proxy` to route that one request through a proxy, which is how a private
+endpoint reachable only over a tunnel gets checked from a container that
+has no tunnel device of its own.
 """
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +56,8 @@ from apihealthchecker.engine.checks import (
     check_http_endpoint,
     check_s3_bucket,
 )
+from apihealthchecker.engine.tailscale import DEFAULT_TIMEOUT_SECONDS as TAILSCALE_TIMEOUT_SECONDS
+from apihealthchecker.engine.tailscale import check_tailscale_path
 
 DEFAULT_MAX_WORKERS = 8
 
@@ -85,6 +94,26 @@ def _http_handler(entry: dict, ctx: dict) -> CheckResult:
         timeout_seconds=entry.get("timeout", 5.0),
         retries=ctx.get("retries", 0),
         retry_delay=ctx.get("retry_delay", 1.0),
+        proxy=entry.get("proxy", ctx.get("proxy")),
+    )
+
+
+def _tailscale_path_handler(entry: dict, ctx: dict) -> CheckResult:
+    """Check the quality of the path to one tailnet peer.
+
+    Unlike the AWS checks this one takes nothing from the shared context
+    except the retry settings: the tailnet it reads is whichever one the
+    local daemon is joined to, and there is no per-entry equivalent of a
+    region to override.
+    """
+    return check_tailscale_path(
+        entry["peer"],
+        require_direct=entry.get("require_direct", True),
+        warm=entry.get("warm", True),
+        diagnose=entry.get("diagnose", True),
+        timeout_seconds=entry.get("timeout", TAILSCALE_TIMEOUT_SECONDS),
+        retries=ctx.get("retries", 0),
+        retry_delay=ctx.get("retry_delay", 1.0),
     )
 
 
@@ -92,6 +121,7 @@ _CHECK_DISPATCH: dict[str, Callable[[dict, dict], CheckResult]] = {
     "s3": _s3_handler,
     "ec2": _ec2_handler,
     "http": _http_handler,
+    "tailscale_path": _tailscale_path_handler,
 }
 
 
@@ -130,6 +160,7 @@ def run_checks(
     profile: str | None = None,
     retries: int = 0,
     retry_delay: float = 1.0,
+    proxy: str | None = None,
 ) -> list[CheckResult]:
     """Run a list of parsed check entries and return results in input order.
 
@@ -143,6 +174,7 @@ def run_checks(
         "profile": profile,
         "retries": retries,
         "retry_delay": retry_delay,
+        "proxy": proxy,
     }
     if not entries:
         return []
@@ -165,6 +197,7 @@ def load_checks_from_file(
     profile: str | None = None,
     retries: int = 0,
     retry_delay: float = 1.0,
+    proxy: str | None = None,
 ) -> list[CheckResult]:
     """Parse a YAML check file and run everything in it.
 
@@ -217,4 +250,5 @@ def load_checks_from_file(
         profile=profile,
         retries=retries,
         retry_delay=retry_delay,
+        proxy=proxy,
     )

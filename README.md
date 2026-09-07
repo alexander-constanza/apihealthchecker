@@ -147,9 +147,9 @@ scheduler tick
 ### 1. [infra-health-check](https://github.com/alexander-constanza/infra-health-check) provides the check engine
 
 Nothing here reimplements checking. `apihealthchecker/engine/` is that repo's
-`checks.py` and `config.py`, and this service calls its public API:
-`check_http_endpoint`, `check_s3_bucket`, `check_ec2_instance`, `run_checks`,
-`CheckResult`, `Status`, `with_retries`.
+`checks.py`, `config.py` and `tailscale.py`, and this service calls its public
+API: `check_http_endpoint`, `check_s3_bucket`, `check_ec2_instance`,
+`check_tailscale_path`, `run_checks`, `CheckResult`, `Status`, `with_retries`.
 
 That API was designed for a consumer like this one, and two of its decisions
 carry all the way through to the UI:
@@ -242,6 +242,7 @@ it was vendored rather than installed, and what was changed.
 |---|---|---|
 | `apihealthchecker/engine/checks.py` | infra-health-check | Vendored verbatim, import paths rewritten |
 | `apihealthchecker/engine/config.py` | infra-health-check | Vendored verbatim, import paths rewritten |
+| `apihealthchecker/engine/tailscale.py` | infra-health-check | Vendored verbatim, import paths rewritten |
 | `apihealthchecker/logging_config.py` | api-debugging-toolkit | Ported verbatim, docstring adapted |
 | `apihealthchecker/validation.py` | api-debugging-toolkit | Pattern ported, rules are this repo's |
 | `apihealthchecker/app.py` | api-debugging-toolkit | Lifecycle and error handlers ported |
@@ -249,7 +250,51 @@ it was vendored rather than installed, and what was changed.
 
 `ruff.toml` excludes `apihealthchecker/engine/` from lint rules that would
 rewrite it, so the vendored files stay byte-comparable with upstream and can be
-re-vendored by copying them again. Fix check behaviour upstream, then re-vendor.
+re-vendored by copying them again. Fix check behaviour upstream, then re-vendor:
+
+```bash
+python3 scripts/vendor_engine.py            # with the repos side by side
+python3 scripts/vendor_engine.py --check    # what CI runs
+```
+
+Copying by hand is how a vendored copy drifts, so the copy is a script, and CI
+checks out upstream and fails the build if the two have diverged. Without that,
+a fix lands in one repo and the other silently keeps the bug.
+
+## Running inside a tailnet
+
+A monitoring service on the public internet can only monitor things that are
+also on the public internet, which means exposing an endpoint is the price of
+watching it. The deployment can instead join a Tailscale tailnet and check
+private endpoints over it, with the API's public ingress rule deleted.
+
+Two things follow from that, and they are separate:
+
+**Checking a private endpoint.** `tailscaled` runs inside the container in
+userspace networking mode, so it needs neither `/dev/net/tun` nor `NET_ADMIN`
+and runs as the image's non-root user. The cost of userspace mode is that the
+app's own sockets do not see the tailnet, so tailscaled also opens a local HTTP
+proxy. Only monitors whose target is a tailnet address are sent through it:
+`tailnet_proxy_for` in `runner.py` matches MagicDNS names and Tailscale's slice
+of the CGNAT range, and everything else keeps going straight out. That
+distinction matters more than it looks. Routing the public monitors through the
+tunnel would put tailscaled on the critical path of every check, so a dead
+tunnel would report the entire internet as down.
+
+**Checking the tailnet itself.** The `tailscale_path` monitor type asks whether
+traffic to a peer is taking a direct path or being relayed through a DERP
+server. That is a real failure that no endpoint check can see: the connection
+works, nothing is down, and every packet is taking a detour through another
+continent. On a relayed verdict the check runs `netcheck` and records why.
+It is operator-only, because `sandbox.py` already refuses any visitor-created
+monitor whose type is not `http`.
+
+The tunnel is opt-in at runtime, not baked into the image. With no
+`TAILSCALE_AUTHKEY` secret set, `entrypoint.sh` starts nothing and the service
+behaves exactly as it did before.
+
+Full build runbook, including the access policy and how to read a relayed
+path: [`docs/TAILNET.md`](docs/TAILNET.md).
 
 ## The scheduler, and the multi-worker problem
 
@@ -707,6 +752,13 @@ Honest about what this is not:
   credentials, so only HTTP monitors are exercised end to end.
 - **`create_all` at boot, not migrations.** A schema change against an existing
   database would need alembic.
+
+## How this was built
+
+Written with AI assistance (Claude), the same way I work day to day: I set the
+design and the constraints, the model drafted, and I reviewed, tested and
+deployed it. The design choices above are mine and I can walk through any of
+them. Everything described here is covered by the test suite.
 
 ## Licence
 

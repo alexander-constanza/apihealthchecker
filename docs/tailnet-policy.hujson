@@ -1,0 +1,91 @@
+// Tailnet access policy for the apihealthchecker deployment.
+//
+// This file replaces the default policy, which is a single rule allowing every
+// device to reach every other device on every port. Replacing it makes the
+// tailnet deny by default: nothing below is implicit, and anything not granted
+// here does not happen.
+//
+// Paste this into the admin console under Access Controls. The console
+// validates it before saving and will refuse a policy that would lock you out.
+//
+// Written against the real deployment, not placeholders:
+//   tailnet   tail422656.ts.net
+//   EC2       i-0f88fbc1a72c890c7, eu-central-1b, private 172.31.41.235
+//   VPC       vpc-0917f7fd736b26485, 172.31.0.0/16
+//   services  tcp/5000 api-debugging-toolkit (gunicorn), tcp/5432 postgres 16
+//
+// Two tags carry the whole model:
+//   tag:infra    the AWS side. The EC2 box, and the subnet router it runs.
+//   tag:monitor  the checker on Fly. Reaches one health endpoint, nothing else.
+//
+// A tagged device belongs to the tag rather than to the person who registered
+// it. That matters twice over here: the Fly machine is created and destroyed by
+// every deploy, and tagged devices have key expiry disabled, so the EC2 box
+// will not silently drop off the tailnet in 180 days.
+{
+  "tagOwners": {
+    "tag:infra":   ["autogroup:admin"],
+    "tag:monitor": ["autogroup:admin"],
+  },
+
+  "grants": [
+    // Operator devices (the laptop) reach the EC2 node on the two ports there
+    // is a reason to reach: SSH for administration, 5000 for the API. Not "*".
+    // The point of writing a policy file is to be able to answer "what is
+    // reachable", and "everything" is not an answer.
+    {
+      "src": ["autogroup:member"],
+      "dst": ["tag:infra"],
+      "ip":  ["tcp:22", "tcp:5000"],
+    },
+
+    // The same devices reach the VPC behind the subnet router. This is the
+    // grant that lets Postgres stop listening to the internet: the database is
+    // still reachable at 172.31.41.235:5432, but only from inside the tailnet.
+    //
+    // Traffic to a routed address is evaluated against the address, not against
+    // the node doing the routing, so the grant above does not cover it. Getting
+    // this wrong is the usual reason a subnet router "does not work": the route
+    // is advertised, approved and installed, and the policy quietly drops the
+    // packets.
+    {
+      "src": ["autogroup:member"],
+      "dst": ["172.31.0.0/16"],
+      "ip":  ["tcp:5000", "tcp:5432"],
+    },
+
+    // The monitor reaches the health endpoint and nothing else. It cannot SSH
+    // anywhere, it cannot reach the database, it cannot reach the laptop, and
+    // it cannot reach any other port on tag:infra. A credential that leaks out
+    // of a container is worth exactly what it can reach.
+    {
+      "src": ["tag:monitor"],
+      "dst": ["tag:infra"],
+      "ip":  ["tcp:5000"],
+    },
+  ],
+
+  // The subnet router may advertise the VPC range without a human approving the
+  // route in the console every time the instance is rebuilt. Scoped to the one
+  // CIDR and the one tag: an auto-approver for "*" would let any tagged node
+  // claim any range and pull traffic towards itself.
+  "autoApprovers": {
+    "routes": {
+      "172.31.0.0/16": ["tag:infra"],
+    },
+  },
+
+  // Tailscale SSH, so the EC2 box needs no public SSH port and no key
+  // distribution. "check" rather than "accept" forces a re-authentication in
+  // the browser every 12 hours, which is the setting worth defending: the
+  // laptop being on the tailnet is not on its own a reason to let it open a
+  // shell six weeks later.
+  "ssh": [
+    {
+      "action": "check",
+      "src":    ["autogroup:member"],
+      "dst":    ["tag:infra"],
+      "users":  ["autogroup:nonroot", "ubuntu"],
+    },
+  ],
+}
