@@ -27,17 +27,18 @@ exit nodes.
 ## The deployment this was written against
 
 Confirmed from the instance itself on 2026-09-07, not assumed. Every command
-below carries these values, so there is nothing to substitute.
+below carries these values, so the only thing to substitute is
+`<ec2-public-ip>`, which stands in for the instance's public address.
 
 | Thing | Value |
 | --- | --- |
 | Tailnet | `tail422656.ts.net` |
 | Instance | `i-0f88fbc1a72c890c7`, Ubuntu 22.04.5 LTS, x86_64, `eu-central-1b` |
-| Addresses | public `18.193.101.255`, private `172.31.41.235` |
+| Addresses | public `<ec2-public-ip>`, private `172.31.41.235` |
 | VPC | `vpc-0917f7fd736b26485`, CIDR `172.31.0.0/16` |
 | Security group | `sg-0554419a1c11d5bd9` |
 | Services | `tcp/5000` api-debugging-toolkit via gunicorn, `tcp/5432` postgres:16-alpine, both in Docker Compose |
-| SSH | `ubuntu@18.193.101.255`, needed once and then replaced by `ssh ec2-api` |
+| SSH | `ubuntu@<ec2-public-ip>`, needed once and then replaced by `ssh ec2-api` |
 
 `net.ipv4.ip_forward` is already `1` on this instance, because Docker sets it.
 Step 3 still writes it into `sysctl.d`, so the subnet router survives a reboot
@@ -149,7 +150,7 @@ makes a direct path more likely, not possible.
 Verify from outside the tailnet, which is the only verification that counts:
 
 ```bash
-curl --max-time 5 http://18.193.101.255:5000/health   # must now time out
+curl --max-time 5 http://<ec2-public-ip>:5000/health   # must now time out
 tailscale down && curl --max-time 5 http://ec2-api:5000/health  # must fail too
 tailscale up  && curl --max-time 5 http://ec2-api:5000/health   # must succeed
 ```
@@ -350,7 +351,7 @@ reports:
 | Varies | No | Easy NAT: one external mapping for all destinations |
 | UPnP / PCP / NAT-PMP | No | No port mapping, so discovery has to do the work |
 | Preferred relay | Frankfurt, 1.62 ms | Nuremberg 4.43 ms second |
-| Endpoints | `18.193.101.255:41641` plus three private | Advertised candidates for a direct path |
+| Endpoints | `<ec2-public-ip>:41641` plus three private | Advertised candidates for a direct path |
 
 `UDP: Yes` with `Varies: No` means this end is not the constraint. If the Fly
 machine ends up relayed, the cause is on the Fly side, and that is a finding
